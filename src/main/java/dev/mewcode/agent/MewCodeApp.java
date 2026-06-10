@@ -43,7 +43,7 @@ public final class MewCodeApp {
         }
         List<ChatMessage> messages = new ArrayList<>();
 
-        ChatConsole console = new ChatConsole("MewCode", configPath);
+        ChatConsole console = new ChatConsole("MewCode", configPath, config.llm());
         console.run(messages, provider);
     }
 
