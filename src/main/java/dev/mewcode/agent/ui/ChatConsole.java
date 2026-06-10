@@ -42,6 +42,7 @@ public final class ChatConsole {
     }
 
     public void run(List<ChatMessage> messages, LlmProvider provider, Registry registry) throws Exception {
+        ToolAgent.Mode mode = ToolAgent.Mode.NORMAL;
         try (Terminal terminal = TerminalBuilder.builder()
                 .name(appName)
                 .system(true)
@@ -66,14 +67,35 @@ public final class ChatConsole {
                 if (input == null || input.trim().isEmpty()) {
                     continue;
                 }
+
                 String trimmed = input.trim();
                 if ("/exit".equalsIgnoreCase(trimmed) || "/quit".equalsIgnoreCase(trimmed)) {
                     return;
                 }
                 if ("/clear".equalsIgnoreCase(trimmed)) {
+                    mode = ToolAgent.Mode.NORMAL;
                     messages.clear();
                     messages.add(new ChatMessage(Role.SYSTEM, Prompt.SYSTEM_PROMPT));
+                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
                     terminal.writer().println("对话上下文已重置。");
+                    terminal.writer().flush();
+                    continue;
+                }
+                if ("/plan".equalsIgnoreCase(trimmed)) {
+                    mode = ToolAgent.Mode.PLAN;
+                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_PLAN));
+                    terminal.writer().println("已进入计划模式：仅允许只读工具，先调研并输出计划。");
+                    terminal.writer().flush();
+                    continue;
+                }
+                if ("/do".equalsIgnoreCase(trimmed)) {
+                    mode = ToolAgent.Mode.NORMAL;
+                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
+                    messages.add(new ChatMessage(Role.USER, Prompt.EXECUTE_DIRECTIVE));
+                    terminal.writer().print("MewCode: ");
+                    terminal.writer().flush();
+                    runAgent(messages, provider, registry, terminal, mode);
+                    terminal.writer().println();
                     terminal.writer().flush();
                     continue;
                 }
@@ -81,16 +103,25 @@ public final class ChatConsole {
                 messages.add(new ChatMessage(Role.USER, input));
                 terminal.writer().print("MewCode: ");
                 terminal.writer().flush();
-
-                ToolAgent agent = new ToolAgent(provider, registry);
-                agent.run(messages, text -> {
-                    terminal.writer().print(text);
-                    terminal.writer().flush();
-                }, new ConsoleToolDisplay(terminal));
-
+                runAgent(messages, provider, registry, terminal, mode);
                 terminal.writer().println();
                 terminal.writer().flush();
             }
+        }
+    }
+
+    private void runAgent(List<ChatMessage> messages, LlmProvider provider, Registry registry,
+                          Terminal terminal, ToolAgent.Mode mode) {
+        ToolAgent agent = new ToolAgent(provider, registry);
+        try {
+            agent.run(messages, text -> {
+                terminal.writer().print(text);
+                terminal.writer().flush();
+            }, new ConsoleToolDisplay(terminal), mode);
+        } catch (Exception e) {
+            terminal.writer().println();
+            terminal.writer().println(YELLOW + "请求失败: " + e.getMessage() + RESET);
+            terminal.writer().flush();
         }
     }
 
@@ -218,7 +249,7 @@ public final class ChatConsole {
         terminal.writer().printf("%sBase URL:%s %s%n", GREEN, RESET, llmConfig.baseUrl());
         terminal.writer().printf("%s配置文件:%s %s%n", GREEN, RESET, configPath);
         terminal.writer().println();
-        terminal.writer().println("执行 /exit 或 /quit 退出对话，/clear 重置对话上下文信息");
+        terminal.writer().println("执行 /exit 或 /quit 退出对话，/clear 重置上下文，/plan 进入计划模式，/do 按计划执行");
         terminal.writer().println();
     }
 }

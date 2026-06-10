@@ -1,328 +1,398 @@
-# 工具系统 Plan
+# Agent Loop Plan
 
-> 基于已批准的 spec.md。本文档与语言相关（Java 21 / Maven）。SDK 类型已对 `com.anthropic:anthropic-java` 2.x、`com.openai:openai-java` 4.x 实测核对。
+> 基于已批准的 spec.md。本文档与语言相关（Java 21）。SDK 类型已对 `com.anthropic:anthropic-java` 2.x、`com.openai:openai-java` 4.x 核对（grounding 实测）。
 
 ## 架构概览
 
-在 Multi-turn「provider → conversation → tui」三件套之上，新增两个包并扩展三处：
+AgentLoop 不新增包，在 ToolSystem「tool / agent / llm / conversation / prompt / tui」之上**扩展**：
 
-- **`dev.mewcode.tool`（新建）**：统一工具抽象 `Tool`、执行结果 `Result`、注册中心 `Registry`、6 个核心工具。零外部依赖（仅 JDK + Jackson，沿用 SDK 已有传递依赖），不感知 LLM 协议。
-- **`dev.mewcode.agent`（新建）**：承载「单轮闭环」编排——请求#1（带工具）→ 收集工具调用 → 注册中心执行 → 结果回灌进 `Conversation` → 请求#2（续答）→ 最终文本 → 停。对外吐出一条 `Flow.Publisher<Event>` 供 TUI 订阅渲染。只依赖 `llm`、`tool`、`conversation`，不 import anthropic-java / openai-java，保持协议无关。
-- **`dev.mewcode.llm`（扩展）**：`Message`/`StreamEvent` 增加工具变体；新增协议无关类型 `ToolCall`/`ToolResult`/`ToolDefinition` 与 `Role.TOOL` 枚举值；`Provider.stream` 增加 `tools` 参数；两个适配器注入工具定义、解析流式工具调用、回灌工具结果。
-- **`dev.mewcode.conversation`（扩展）**：新增「assistant 工具调用回合」与「工具结果回合」的追加方法。
-- **`dev.mewcode.prompt`（扩展）**：`SYSTEM_PROMPT` 增补 Agent 角色与工具使用约定。
-- **`dev.mewcode.tui`（扩展）**：提交逻辑改走 `Agent.run`；订阅 `Flow.Publisher<agent.Event>` 处理工具事件；渲染 Claude Code 风格工具行与执行指示。
-- **`dev.mewcode.Main`（扩展）**：构造 `Registry.defaultRegistry()` 并注入 `TuiApp`。
+- **dev.mewcode.agent（重写 `Agent.run`）**：把 ToolSystem 的「请求#1 → 执行 → 请求#2 → 停」改为真正的 ReAct 循环——`for` 迭代直到自然完成 / 上限 / 取消 / 连续未知工具 / 出错。新增保序分批并发执行、迭代进度与用量事件、终止时的历史一致性收尾、Plan/Normal 两种模式。
+- **dev.mewcode.llm（扩展）**：`StreamEvent` 新增 `Usage` 子类型；`Provider.stream` 增 `String systemSuffix` 形参（Plan Mode 系统提示后缀）；两适配器在流结束后上抛本轮 token 用量、把 `systemSuffix` 拼到内置系统提示后；OpenAI 打开 `ChatCompletionStreamOptions.includeUsage`。
+- **dev.mewcode.tool（扩展）**：`Tool` 接口增 `boolean readOnly()`；6 个工具各实现；`Registry` 增 `readOnlyDefinitions()` 与 `isReadOnly(name)`。
+- **dev.mewcode.conversation（扩展）**：增 `Optional<Role> lastRole()`（终止收尾判断角色尾巴）。
+- **dev.mewcode.prompt（扩展）**：增 `PLAN_MODE_REMINDER`（计划态系统后缀）与 `EXECUTE_DIRECTIVE`（`/do` 触发执行的用户消息）；`SYSTEM_PROMPT` 增补「持续工作直到任务完成」的 Agent 循环约定。
+- **dev.mewcode.tui（扩展）**：`submit` 识别 `/plan`、`/do`；引入 per-turn 取消标志位与 cancel 钩子；事件订阅器处理用量 / 进度 / 通知 / 多个并发工具；按键处理拆分 Esc / Ctrl+C；状态栏显示模式与累计用量、动态区显示迭代轮次。
 
-依赖方向（无环）：`tool → llm`；`conversation → llm`；`agent → {llm, tool, conversation}`；`tui → {agent, tool, conversation, llm, prompt}`；`llm → {config, prompt}`。
+依赖方向不变、无环：`tool → llm`；`conversation → llm`；`agent → {llm, tool, conversation}`；`tui → {agent, tool, conversation, llm, prompt}`；`llm → {config, prompt}`。
 
 ## 核心数据结构
 
-### llm 包（扩展）
+### llm 包（`StreamEvent` 扩展）
 
 ```java
 package dev.mewcode.llm;
 
-// Role 增加 TOOL：携带工具执行结果的回合。
-public enum Role { USER, ASSISTANT, TOOL }
+// Usage 协议无关地承载一轮请求的 token 用量。
+public record Usage(long inputTokens, long outputTokens) {}
 
-// ToolCall 协议无关地承载模型发起的一次工具调用（流式拼接完成后）。
-public record ToolCall(
-        String id,          // provider 侧调用 id；回灌结果时配对
-        String name,        // 工具名（注册中心按名查找）
-        String inputJson    // 拼接完成的 JSON 参数（原始字符串）
-) {}
-
-// ToolResult 协议无关地承载一次工具执行结果。
-public record ToolResult(
-        String toolCallId,  // 对应 ToolCall.id
-        String content,     // 执行产出（成功内容或结构化错误文本）
-        boolean isError     // 是否为错误结果（F9）
-) {}
-
-// ToolDefinition 注册中心导出的协议无关工具定义。
-public record ToolDefinition(
-        String name,
-        String description,
-        Map<String, Object> inputSchema   // 完整 JSON Schema 对象：type/properties/required
-) {}
-
-// Message 扩展：assistant 回合可带 toolCalls；TOOL 回合带 toolResults。
-public record Message(
-        Role role,
-        String content,
-        List<ToolCall> toolCalls,       // 仅 assistant：本回合请求的工具调用，可空
-        List<ToolResult> toolResults    // 仅 TOOL：工具执行结果，一条消息可含多个
-) {
-    public static Message user(String text)      { return new Message(Role.USER, text, List.of(), List.of()); }
-    public static Message assistant(String text) { return new Message(Role.ASSISTANT, text, List.of(), List.of()); }
-}
-
-// StreamEvent 扩展：在 TextDelta/Done/Failed 之外，新增 ToolCalls。
+// StreamEvent 扩展：在 TextDelta / ToolCalls / Done / Failed 之外，
+// turn 结束时一次性上抛 UsageEvent（Done 之前发出）。
 public sealed interface StreamEvent
-        permits StreamEvent.TextDelta, StreamEvent.ToolCalls, StreamEvent.Done, StreamEvent.Failed {
+        permits StreamEvent.TextDelta,
+                StreamEvent.ToolCalls,
+                StreamEvent.UsageEvent,
+                StreamEvent.Done,
+                StreamEvent.Failed {
+
     record TextDelta(String text) implements StreamEvent {}
-    record ToolCalls(List<ToolCall> calls) implements StreamEvent {}  // Done 之前发出
+    record ToolCalls(java.util.List<ToolCall> calls) implements StreamEvent {}
+    record UsageEvent(Usage usage) implements StreamEvent {} // 新增
     record Done() implements StreamEvent {}
     record Failed(Throwable error) implements StreamEvent {}
 }
 ```
 
-`Provider.stream` 签名变更：
+`Provider.stream` 签名变更（新增第 3 形参）：
 
 ```java
-Flow.Publisher<StreamEvent> stream(List<Message> messages, List<ToolDefinition> tools);
+// systemSuffix 非空时拼接到内置 system prompt 之后（Plan Mode 计划态约束）；为空即普通模式。
+java.util.concurrent.Flow.Publisher<StreamEvent> stream(
+        java.util.List<Message> messages,
+        java.util.List<ToolDefinition> tools,
+        String systemSuffix);
 ```
 
-`tools` 为空表示本次请求不带工具。续答请求（请求#2）仍传入 `tools`（与真实协议一致），但编排层忽略其再次返回的工具调用（单轮）。
+`Message`/`ToolCall`/`ToolResult`/`ToolDefinition` 与 `Role.TOOL` 沿用 ToolSystem，不变。
 
-### tool 包（新建）
+### tool 包（接口扩展）
 
 ```java
-package dev.mewcode.tool;
-
-// Result 工具执行结果——永远以值类型返回，从不抛 checked exception。
-public record Result(String content, boolean isError) {
-    public static Result ok(String content)    { return new Result(content, false); }
-    public static Result error(String content) { return new Result(content, true);  }
-}
-
-// Tool 统一工具抽象（F1）。
+// Tool 接口新增 readOnly：true=只读工具（可并发执行 & Plan Mode 放行）。
 public interface Tool {
-    String name();                           // 模型看到的工具名，如 "read_file"
-    String description();                    // 给模型的用途说明
-    Map<String, Object> parameters();        // 手写 JSON Schema（type/properties/required/description）
-    Result execute(ToolContext ctx, String inputJson);  // 解析失败/IO 失败一律包成 Result.error(...)
-}
-
-// ToolContext 把超时/取消信号传给工具实现。
-public record ToolContext(java.util.concurrent.atomic.AtomicBoolean cancelled) {}
-
-// Registry 集中登记、按名查找、导出定义、按名执行。
-public final class Registry {
-    private final List<String> order = new ArrayList<>();        // 保持注册顺序，导出稳定
-    private final Map<String, Tool> tools = new HashMap<>();
-
-    public void register(Tool t)                                   { ... }
-    public Optional<Tool> get(String name)                         { ... }
-    public List<ToolDefinition> definitions()                       { ... }  // F3/AC1：按序导出
-    public Result execute(ToolContext ctx, String name, String args) { ... } // F5/F9：未知工具兜底为 error
-
-    public static Registry defaultRegistry() { ... }  // 构造并注册 6 个工具
-
-    public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(30); // N1，不可配
+    String name();
+    String description();
+    java.util.Map<String, Object> parameters();
+    boolean readOnly(); // 新增
+    Result execute(CancelToken cancel, com.fasterxml.jackson.databind.JsonNode args);
 }
 ```
 
-每个工具私有入参 record，`execute` 内用 Jackson 把 `inputJson` 反序列化到该 record，解析失败转为 `Result.error(...)`：
+只读分类（依据语义）：`ReadFileTool` / `GlobTool` / `GrepTool` → `true`；`WriteFileTool` / `EditFileTool` / `BashTool` → `false`（`BashTool` 可执行任意副作用命令，保守归为有副作用、串行执行）。
 
-| 工具名 | 参数（JSON Schema） | 成功结果 | 错误结果 |
-|--------|--------------------|---------|---------|
-| `read_file` | `path`(必填) | 带行号文本（`%6d\t` 风格，≤2000 行 / ≤256KB，超出截断标注 `[truncated]`） | 不存在/不可读/是目录 |
-| `write_file` | `path`(必填)、`content`(必填) | `Files.createDirectories(...)` 建父目录后 `Files.writeString(...)` 覆盖，返回路径与字节数 | 写入失败 |
-| `edit_file` | `path`、`old_string`、`new_string`(均必填) | 子串出现次数==1 时唯一替换并写回 | 0 处→「未找到匹配」；>1 处→「匹配到 N 处，old_string 不唯一，请提供更长上下文」 |
-| `bash` | `command`(必填) | 按平台选 shell（Unix `sh -c` / Windows `cmd /C`）`ProcessBuilder` 执行；带 `Process.waitFor(timeout)` 超时；返回 stdout/stderr/exit_code（合并视图截断 ~30000 字符） | 超时（isError）；命令非零退出按结果回灌 |
-| `glob` | `pattern`(必填，如 `**/*.java`)、`path`(可选，默认 cwd) | 匹配路径列表（≤100，排序） | 无匹配返回空说明（非 isError） |
-| `grep` | `pattern`(必填，Java `Pattern` 正则)、`path`(可选)、`glob`(可选文件名过滤) | `file:line:content` 列表（≤100，超出标注） | 正则非法（isError）；无命中返回空说明 |
+`Registry` 新增：
 
-### agent 包（新建）
+```java
+// Plan Mode：只导出 readOnly()==true 的工具定义。
+public java.util.List<ToolDefinition> readOnlyDefinitions();
+
+// 分批判定；未知工具返回 false（按串行处理）。
+public boolean isReadOnly(String name);
+```
+
+### agent 包（事件模型扩展 + `run` 重写）
 
 ```java
 package dev.mewcode.agent;
 
-import java.util.concurrent.Flow;
+// Usage 一轮请求的 token 用量（透传 llm.Usage 的语义）。
+public record Usage(long input, long output) {}
 
-// Agent 持有 provider 与注册中心，执行单轮闭环。
-public final class Agent {
-    private final Provider provider;
-    private final Registry registry;
-    public Agent(Provider p, Registry r) { ... }
+// Mode 区分普通模式与计划模式。
+public enum Mode { NORMAL, PLAN }
 
-    // 执行单轮闭环，返回事件 Publisher。订阅者一般是 TUI 的 EventPump。
-    public Flow.Publisher<Event> run(Conversation conv) { ... }
+// Event 对外事件流元素，消费者据子类型分派渲染（sealed + pattern matching）。
+public sealed interface Event
+        permits Event.TextDelta,
+                Event.Tool,
+                Event.UsageReport,
+                Event.Iter,
+                Event.Notice,
+                Event.Done,
+                Event.Failed {
+
+    record TextDelta(String text) implements Event {}              // 模型文本增量（preamble 或最终答复）
+    record Tool(ToolEvent toolEvent) implements Event {}           // 工具调用开始/结束（沿用 ToolSystem）
+    record UsageReport(Usage usage) implements Event {}            // 本轮 token 用量（每轮 stream 结束后一次）
+    record Iter(int iter) implements Event {}                      // 进入第 iter 轮迭代（进度提示）
+    record Notice(String message) implements Event {}              // 系统提示（停止原因等）；仅 UI 展示，不入历史
+    record Done() implements Event {}                              // 本轮（整个 Loop）结束
+    record Failed(Throwable error) implements Event {}             // 出错（不中断会话）
 }
 
-// Phase 工具事件阶段。
-public enum Phase { START, END }
+// Agent.run 执行 Agent Loop，返回事件 Publisher；mode 决定工具集与系统后缀。
+public java.util.concurrent.Flow.Publisher<Event> run(
+        dev.mewcode.conversation.Conversation conv,
+        Mode mode,
+        CancelToken cancel);
+```
 
-// ToolEvent 一次工具调用的开始/结束（供 TUI 渲染工具行与结果摘要）。
-public record ToolEvent(
-        String name,
-        String args,     // 参数预览（用于 ● name(args)）
-        Phase phase,
-        String result,   // END：结果摘要
-        boolean isError  // END：是否错误
-) {}
+`ToolEvent`、`Phase`(START/END)、`Agent`、`Agent(provider, registry)` 构造沿用 ToolSystem。`run` 签名新增 `mode` 形参与 per-turn `CancelToken`。
 
-// Event 单轮闭环对外事件流；sealed 让 TUI 按变体分派渲染。
-public sealed interface Event
-        permits Event.Text, Event.Tool, Event.Done, Event.Failed {
-    record Text(String delta) implements Event {}             // 文本增量（preamble 或最终答复）
-    record Tool(ToolEvent event) implements Event {}          // 工具调用开始/结束
-    record Done() implements Event {}                          // 本轮结束
-    record Failed(Throwable error) implements Event {}         // 出错（不中断会话）
+`Agent` 构造沿用 ToolSystem：`public Agent(Provider provider, Registry registry)`。`mode` 为 `run` 的每次调用入参，不写入 `Agent` 状态（同一 `Agent` 可被不同 mode 复用）。
+
+迭代、停止常量与提示文案（内置，不可配）：
+
+```java
+final class AgentConstants {
+    static final int MAX_ITERATIONS  = 25; // 迭代上限兜底（F2）
+    static final int MAX_UNKNOWN_RUN = 3;  // 连续「整轮只产生未知工具调用」的迭代数上限（F2）
+
+    // 停止/收尾提示文案——既作为 Event.Notice 推给 UI，
+    // 也作为 ensureAssistantTail 写入历史的兜底文本。
+    static final String NOTICE_MAX_ITER       = "(已达最大迭代轮数 25,自动停止;可继续发消息推进。)";
+    static final String NOTICE_UNKNOWN_TOOLS  = "(连续多轮只请求到未注册的工具,自动停止。)";
+    static final String NOTICE_STREAM_ERR     = "(请求出错,本轮已中断。)";
+    static final String NOTICE_CANCELLED      = "(已取消。)";
 }
 ```
 
-`Agent.run` 内部用 `SubmissionPublisher<Event>` 作为输出端，开一个 virtual thread 跑「请求#1 → 执行工具 → 请求#2」整条链路，sub-publisher 订阅与等待逻辑都在 virtual thread 内同步推进。
+`CancelToken` 为本章引入的轻量取消句柄（`volatile boolean cancelled` + `cancel()` 方法 + 可选回调），取代 Go 的 `ctx.Done()`；适配器内的虚拟线程在每个流事件回调里轮询 `cancel.isCancelled()`，工具执行同样接收 `CancelToken` 并在阻塞处定期检查。
 
 ## 模块设计
 
-### dev.mewcode.tool
+### dev.mewcode.agent（核心：`run` 重写）
 
-**职责：** 提供 6 个工具的统一抽象与执行；集中登记与导出；所有失败包成 `Result.error(...)` 而非抛异常（F1/F2/F9/N4）。
-**对外接口：** `Tool`、`Result`、`ToolContext`、`Registry`、`Registry.defaultRegistry`。
-**依赖：** JDK（`java.nio.file`、`java.util.regex`、`java.lang.ProcessBuilder`、`java.util.concurrent`）、Jackson（解析参数 JSON，跟随 anthropic-java/openai-java 已有依赖，不新增坐标）、`dev.mewcode.llm`（仅为 `definitions()` 返回 `List<ToolDefinition>`）。
-**关键实现点：**
-- Schema 手写为 `Map<String, Object>`（`LinkedHashMap` 保序）：OpenAI 直接整体传给 `FunctionDefinition.parameters(...)`；Anthropic 由 llm 适配器取 `"properties"`/`"required"`。
-- `read_file` 带行号、行/字节上限、`[truncated]` 标注（N5/AC2）。`Files.readString` 后按 `\n` 切分，超过 2000 行截断。
-- `edit_file` 唯一匹配语义 + 含计数的可区分错误（AC4）；用 `content.split(oldString, -1).length - 1` 统计次数。
-- `bash` 用 `ProcessBuilder`：Windows `new ProcessBuilder("cmd","/C",cmd)`，其余 `new ProcessBuilder("sh","-c",cmd)`；`redirectErrorStream(true)` 合并；`process.waitFor(DEFAULT_TIMEOUT.toMillis(), MILLISECONDS)` 超时 → `process.destroyForcibly()` 后 `Result.error("命令超时")`（AC5/N1）。捕获 stdout 用单独 virtual thread 读取 `getInputStream()` 避免管道阻塞。
-- `glob`：基于 `Files.walk` + 自实现段匹配（Java `PathMatcher` 的 `glob:` 语法对 `**` 仅支持目录单层，需自写跨任意层级版本）。
-- `grep`：`Pattern.compile(...)` 失败 → `Result.error`；`Files.walk` 遍历 + `Files.lines` 逐行扫；循环中检查 `ctx.cancelled().get()`。
-- 空 `inputJson`（OpenAI 可能给空串而非 `"{}"`）按 `"{}"` 处理，避免误报参数错误。
+**职责：** ReAct 循环编排（F1/F2）、保序分批并发执行（F5）、事件流（F3/F8/F9）、终止历史一致性（F6）、Plan/Normal 模式（F10）。
+**对外接口：** `Agent`、构造函数、`run(conv, mode, cancel)`、`Event` sealed 接口、`ToolEvent`、`Phase`、`Mode`、`Usage`、`CancelToken`。
+**依赖：** `llm`、`tool`、`conversation`、`java.util.concurrent.Flow`、`java.util.concurrent.SubmissionPublisher`、`java.util.concurrent.StructuredTaskScope`（或 `CompletableFuture` 集合，二选一，见技术决策）。
 
-### dev.mewcode.agent
+**`run` 算法（virtual thread 内执行，try-with-resources 关 `SubmissionPublisher<Event> bus`）：**
 
-**职责：** 单轮闭环编排（F5/F6），保证 AC9 单轮上限；把 provider 的 `StreamEvent` 与工具执行翻译成统一 `Event` 流。
-**对外接口：** `Agent`、`Event`、`ToolEvent`、`Phase`。
-**依赖：** `llm`、`tool`、`conversation`、JDK `java.util.concurrent.Flow` / `SubmissionPublisher`。
-**run 算法（在 virtual thread 内顺序执行）：**
-1. `var defs = registry.definitions();`
-2. **请求#1**：`streamOnce(conv, defs, out)` → 转发 `TextDelta` 到 `out` 上的 `Event.Text`、累积完整 preamble 文本、收集 `ToolCalls`；失败发 `Event.Failed` 后结束。
-3. 若无 `ToolCalls`：`conv.addAssistant(preamble)`，发 `Event.Done`，结束（纯文本回合，与 Multi-turn 等价）。
-4. 有 `ToolCalls`：`conv.addAssistantWithToolCalls(preamble, calls)`。
-5. 顺序执行每个 call：发 `Event.Tool(START, name, args)` → `var tctx = new ToolContext(new AtomicBoolean(false));` → 提交 virtual thread 执行 `registry.execute(tctx, call.name(), call.inputJson())` 并 `Future.get(DEFAULT_TIMEOUT)`；超时 → `tctx.cancelled().set(true)` + 返回超时 `Result.error("工具执行超时")` → 发 `Event.Tool(END, name, result, isError)` → 收集 `ToolResult(call.id(), result.content(), result.isError())`。
-6. `conv.addToolResults(results)`.
-7. **请求#2**：`streamOnce(...)` → 转发最终答复 `Event.Text`、累积 final 文本；**忽略**其返回的任何 `ToolCalls`（单轮，AC9）。
-8. `conv.addAssistant(final)`，发 `Event.Done`。
-- 订阅取消（TUI 退出 / Ctrl+C）时 `SubmissionPublisher.close()`，virtual thread 通过 `Thread.interrupted()` 退出每个阶段；工具执行 future 也会被 `cancel(true)` 中断。
+1. 按 `mode` 取工具集与系统后缀：
+  - `Mode.PLAN`   → `defs = registry.readOnlyDefinitions()`；`suffix = Prompt.PLAN_MODE_REMINDER`。
+  - `Mode.NORMAL` → `defs = registry.definitions()`；`suffix = ""`。
+2. `int unknownRun = 0;`
+3. `for (int iter = 1; iter <= MAX_ITERATIONS; iter++)`：
+  1. `emit(new Event.Iter(iter))`（进度，F9）；emit 返回 false（已取消）→ `finishCancelled(conv)`、`return`。
+  2. `StreamOutcome out = streamOnce(conv, defs, suffix, cancel, bus);`
+    - `out.failed()` 且 `cancel.isCancelled()` → `finishCancelled(conv)`、`return`。
+    - `out.failed()` 且未取消（流出错，`Event.Failed` 已在 `streamOnce` 内发出）→ `ensureAssistantTail(conv, NOTICE_STREAM_ERR)`、`return`。
+  3. `if (out.usage() != null) emit(new Event.UsageReport(new Usage(out.usage().inputTokens(), out.usage().outputTokens())))`（F8）。
+  4. **无工具** `out.calls().isEmpty()`：`conv.addAssistant(ensureFinal(bus, out.text()))`；`emit(new Event.Done())`；`return`（自然完成，F2-1）。
+  5. **有工具**：`conv.addAssistantWithToolCalls(out.text(), out.calls())`。
+  6. 统计未知工具：`if (allUnknown(out.calls())) unknownRun++; else unknownRun = 0;`
+  7. `BatchOutcome batch = executeBatched(out.calls(), cancel, bus);`（保序分批并发，F5）。
+  8. `conv.addToolResults(batch.results())`（无论是否取消都回灌，含已取消占位，F6）。
+  9. `if (!batch.completed())`（执行中被取消）→ `ensureAssistantTail(conv, NOTICE_CANCELLED)`、`return`。
+  10. `if (unknownRun >= MAX_UNKNOWN_RUN)` → `emit(new Event.Notice(NOTICE_UNKNOWN_TOOLS))`；`ensureAssistantTail(conv, NOTICE_UNKNOWN_TOOLS)`；`emit(new Event.Done())`；`return`（F2-4）。
+4. 循环正常走完（触达上限）：`emit(new Event.Notice(NOTICE_MAX_ITER))`；`ensureAssistantTail(conv, NOTICE_MAX_ITER)`；`emit(new Event.Done())`（F2-2）。
+
+**`streamOnce(conv, defs, suffix, cancel, bus) → StreamOutcome(text, calls, usage, failed)`：**
+订阅 `provider.stream(conv.messages(), defs, suffix)`（`Flow.Publisher<llm.StreamEvent>`），用一个内部 `Flow.Subscriber` 同步消费：
+- `StreamEvent.Failed f` → `emit(new Event.Failed(f.error()))`、返回 `failed=true`。
+- `StreamEvent.UsageEvent u` → 记录 `usage = u.usage()`（不立即 emit，由 `run` 在拿到后统一 emit）。
+- `StreamEvent.ToolCalls tc` → `calls.addAll(tc.calls())`。
+- `StreamEvent.TextDelta d` → 累积 `text` 并 `emit(new Event.TextDelta(d.text()))`；emit 失败→标记 `failed=true`。
+- `StreamEvent.Done` → 结束订阅。
+  循环结束后若 `cancel.isCancelled()` 即视为失败；否则返回 `new StreamOutcome(text.toString(), calls, usage, false)`。
+
+**`executeBatched(calls, cancel, bus) → BatchOutcome(results, completed)`：**
+保序分批（F5）。`ToolResult[] results = new ToolResult[calls.size()];` 从 `i=0` 逐段扫描：
+- 当前 `calls.get(i)` 只读 → 向前吃连续只读得最长区间 `[i, j)`（`j` 为首个非只读或末尾），**并发**执行该批：用 `Thread.ofVirtual().start(() -> ...)` 为每个调用起一个虚拟线程，线程内 `var toolCancel = cancel.withTimeout(Tool.DEFAULT_TIMEOUT)`（基于 `ScheduledExecutorService` 调度的派生 token）后 `registry.execute(toolCancel, ...)`，结果写入**自己下标** `results[k]`（互不重叠，无锁）；用 `CountDownLatch(j - i)` 等齐所有线程。`i = j`。
+- 当前 `calls.get(i)` 非只读 → **串行**执行单个 `calls.get(i)`（同样 `cancel.withTimeout(Tool.DEFAULT_TIMEOUT)`），写 `results[i]`。`i++`。
+- 每段开始执行前先判 `cancel.isCancelled()`：给区间内尚未执行的 call 填「已取消」结果（`new ToolResult(callId, NOTICE_CANCELLED, true)`），其余沿用已得结果，`return new BatchOutcome(List.of(results), false)`。
+- 全部完成 `return new BatchOutcome(List.of(results), true)`。
+
+> 超时口径：每个工具各拿一个 `DEFAULT_TIMEOUT`（30s）派生 cancel token，互不相加——并发批的整体上限仍是单个 30s（N1）。派生 token 都挂在 per-turn `cancel` 下，用户取消时一并触发，工具尽快返回。
+
+事件与顺序（满足 N3 顺序、N2 不阻塞、N6 无竞争）：
+- 单个串行工具：`emit(Event.Tool{Start})` → 执行 → `emit(Event.Tool{End})`（沿用 ToolSystem 时序，动态区显示该工具 Running）。
+- 并发批：**先**按序 `emit(Event.Tool{Start})` 区间内每个工具（动态区列出多个在执行的工具行）→ 并发执行 → **再**按原始顺序 `emit(Event.Tool{End})` 每个工具（逐个把工具行 + 结果摘要提交 scrollback）。即「开始事件按序、结束事件按序」，并发只发生在执行环节，事件顺序始终是调用序，scrollback 不交错。
+- 并发安全：每个虚拟线程只写自己下标的 `results[k]`（不同下标互不重叠），不触碰 `conv`；`conv.addToolResults` 由 `run` 主流程在 `CountDownLatch.await()` 后串行调用。Token 用量累计在 TUI 侧串行处理。
+
+**辅助函数：**
+- `emit(bus, event) → boolean`：沿用 ToolSystem——`if (cancel.isCancelled()) return false; bus.submit(event); return true;`。返回 false 当且仅当 per-turn cancel 被触发（`SubmissionPublisher` 由 `run` 自己持有并 try-with-resources 关闭，不会在提交中被外部关）。调用方据 false 提前收尾。
+- `allUnknown(calls)`：对每个 call 用 `registry.get(call.name())` 判断，**全部** `Optional.isEmpty()` 才返回 true；任一已注册即 false（混入已知工具视为有进展，计数重置）。不能用 `isReadOnly`（未知工具它也返回 false，会与有副作用工具混淆）。
+- `ensureFinal(bus, text)`：沿用 ToolSystem——`text` 非空原样返回；为空则 emit 占位提示并返回占位文本（避免空 assistant 回合破坏下一轮请求）。
+- `ensureAssistantTail(conv, fallback)`：若 `conv.lastRole().orElse(null) != Role.ASSISTANT`（含空历史、末尾为 user 或 `Role.TOOL`），调 `conv.addAssistant(fallback)`，保证历史以 assistant 文本回合收尾（F6：取消/出错/上限后角色仍交替，下一轮请求不报 400）。
+- `finishCancelled(conv)`：取消路径统一收尾——`ensureAssistantTail(conv, NOTICE_CANCELLED)`、`return`（**不 emit**，因 cancel 已触发 emit 必失败；`bus` 经 try-with-resources 关闭，TUI 由订阅器收到 `onComplete()` 即视为结束）。
+
+> 终止优先级：执行中取消（`batch.completed()==false`）是**最高优先级**终止——立即 `ensureAssistantTail` 并 `return`，**跳过**未知工具计数与迭代上限检查。
 
 ### dev.mewcode.llm（扩展）
 
-**职责：** 协议无关请求/响应抽象 + 两协议工具调用全流程（F3/F4/F6/F7）。
+**职责：** 协议无关请求/响应 + 两协议工具调用全流程（沿用 ToolSystem）+ 本轮用量上抛（F8）+ 系统后缀（F10）。
 
-**AnthropicProvider 关键改动：**
-- 请求构造加 `params.tools(toAnthropicTools(tools))`：每项 `ToolUnion.ofTool(Tool.builder().name(d.name()).description(d.description()).inputSchema(JsonObject.fromString(jackson.writeValueAsString(d.inputSchema()))).build())`。
-- 流式订阅累加：保留一个 `MessageAccumulator acc = MessageAccumulator.create();`，每次回调 `acc.accumulate(event)`；文本 delta 仍上抛，`InputJsonDelta`/`ThinkingDelta` 不上抛（由 accumulator 缓冲/丢弃）。
-- 流结束后若 `acc.finalMessage().stopReason()==StopReason.TOOL_USE`：遍历 `acc.finalMessage().content()`，对 `ContentBlock.ToolUse` 收集 `ToolCall(id, name, jackson.writeValueAsString(input))`，先发 `StreamEvent.ToolCalls`，再发 `StreamEvent.Done`。
-- `toAnthropicMessages` 扩展：assistant 回合若有 `toolCalls`，内容数组里追加 `ContentBlockParam.ofToolUse(ToolUseBlockParam.builder().id(c.id()).name(c.name()).input(JsonObject.fromString(c.inputJson())).build())`（可与文本块共存）；`Role.TOOL` 回合把每个 `ToolResult` 用 `ContentBlockParam.ofToolResult(ToolResultBlockParam.builder().toolUseId(r.toolCallId()).content(r.content()).isError(r.isError()).build())` 拼进**一条 user 消息**（Anthropic 协议要求 tool_result 由 user 角色提交）。
+**`StreamEvent.java`：** sealed 接口新增 `UsageEvent(Usage usage)` 子类型；新增 `Usage` record。
 
-**OpenAIProvider 关键改动：**
-- 请求构造加 `params.tools(toOpenAITools(tools))`：每项 `ChatCompletionTool.ofFunction(FunctionDefinition.builder().name(d.name()).description(d.description()).parameters(FunctionParameters.fromMap(d.inputSchema())).build())`。
-- 流式订阅累加：用 `ChatCompletionAccumulator acc = ChatCompletionAccumulator.create();` 每次 `acc.accumulate(chunk)`；`chunk.choices().get(0).delta().content()` 非空时仍上抛 `TextDelta`。
-- 流结束后读 `acc.chatCompletion().choices().get(0).message().toolCalls()`（不依赖 `JustFinishedToolCall` 之类流式辅助类，因其在多工具下不可靠）；非空则组 `ToolCall(tc.id(), tc.function().name(), tc.function().arguments())`，先发 `StreamEvent.ToolCalls` 再发 `StreamEvent.Done`。`finishReason()=="tool_calls"` 与 acc 是否含工具调用同时判定（兼容端点兜底）。
-- `toOpenAIMessages` 扩展：assistant 回合若有 `toolCalls`，**手工**构造 `ChatCompletionAssistantMessageParam.builder().content(text).toolCalls(List.of(ChatCompletionMessageToolCall.ofFunction(...))).build()`（`AssistantMessage(string)` 助手便捷构造不携带工具调用）；`Role.TOOL` 回合每个 `ToolResult` 发一条 `ChatCompletionToolMessageParam.builder().toolCallId(r.toolCallId()).content(r.content()).build()`。
+**`Provider.java`：** `stream` 增 `String systemSuffix` 形参（更新接口 Javadoc 说明 systemSuffix 语义）。
+
+**`AnthropicProvider.java`：**
+- 系统提示：`MessageCreateParams.system(...)` 由硬编码 `Prompt.SYSTEM_PROMPT` 改为 `effectiveSystem(suffix)`——`suffix==""` 时单块 `Prompt.SYSTEM_PROMPT`；非空时拼成 `Prompt.SYSTEM_PROMPT + "\n\n" + suffix`（单 `TextBlockParam`，避免多块边界差异）。
+- 用量：SDK 的异步流式订阅 `onCompleteFuture` 完成且无异常后，在上抛 `ToolCalls` / `Done` 之前从累加器 `MessageAccumulator` 读 `accumulator.message().usage()`：`pub.submit(new StreamEvent.UsageEvent(new Usage(usage.inputTokens(), usage.outputTokens())))`（usage 仅在流结束后完整）。
+- 历史含工具交互时 thinking 已自动关闭（ToolSystem 既有逻辑），多轮续答沿用，无需改动。
+
+**`OpenAIProvider.java`：**
+- 请求构造增 `params.streamOptions(ChatCompletionStreamOptions.builder().includeUsage(true).build())`（不开则流式 usage 为空）。
+- 系统提示：`toOpenAIMessages` 接收 `suffix`，把首条 system 消息文本由 `Prompt.SYSTEM_PROMPT` 改为拼接 `suffix`（非空时 `+"\n\n"+suffix`）。
+- 用量：流结束后从累加器读 `CompletionUsage`：`pub.submit(new StreamEvent.UsageEvent(new Usage(usage.promptTokens(), usage.completionTokens())))`。
+
+### dev.mewcode.tool（扩展）
+
+- `Tool` 接口加 `boolean readOnly()`；6 个工具各加一行实现（read/glob/grep 返回 true，write/edit/bash 返回 false）。
+- `Registry.readOnlyDefinitions()`：仿 `definitions()`，仅收 `tools.get(name).readOnly()==true` 的项，保持注册顺序。
+- `Registry.isReadOnly(name)`：`Optional<Tool> t = get(name); return t.isPresent() && t.get().readOnly();`（未知工具 false）。
+- `execute`、`Tool.DEFAULT_TIMEOUT`、6 工具的执行逻辑均不变。
 
 ### dev.mewcode.conversation（扩展）
 
 ```java
-public void addAssistantWithToolCalls(String text, List<ToolCall> calls); // assistant 工具调用回合
-public void addToolResults(List<ToolResult> results);                       // Role.TOOL 结果回合
+// lastRole 返回最后一条消息的角色;空历史返回 Optional.empty()。
+public java.util.Optional<Role> lastRole();
 ```
-保留 `addUser`/`addAssistant`/`messages` 不变。
+其余沿用 ToolSystem。
+
+### dev.mewcode.prompt（扩展）
+
+```java
+// PLAN_MODE_REMINDER:Plan Mode 系统提示后缀,拼接到 SYSTEM_PROMPT 之后。
+public static final String PLAN_MODE_REMINDER =
+        "You are currently in PLAN MODE. You may use ONLY the read-only tools "
+        + "(read_file, glob, grep) to investigate the codebase. You must NOT write files, edit files, "
+        + "or run shell commands. Produce a clear, step-by-step plan for the task, then stop and wait for "
+        + "the user to approve it with /do before doing any work.";
+
+// EXECUTE_DIRECTIVE:/do 注入的用户消息——指示模型按上文已确认的计划开始执行,可使用全部工具。
+public static final String EXECUTE_DIRECTIVE = "请按上面的计划开始执行。";
+```
+
+`SYSTEM_PROMPT` 增补一句 Agent 循环约定（追加到现有文案）：`"Keep using tools across multiple steps to make progress, and only give your final concise answer once the task is complete."`（中文项目里保持英文 system prompt 风格，与 ToolSystem 现有 `SYSTEM_PROMPT` 一致）。
 
 ### dev.mewcode.tui（扩展）
 
-**职责：** 渲染 `agent.Event`（文本/工具行/结果摘要/错误/结束），保持非阻塞（N2）。
-- `TuiApp` 构造增加 `Registry registry` 字段；新 `submit` 流程：`conv.addUser(text)` 后 `new Agent(provider, registry).run(conv).subscribe(eventPump)`（不再直接调 `Provider.stream`）。
-- 新增 `EventPump implements Flow.Subscriber<agent.Event>`：`onNext` 调 `gui.getGUIThread().invokeLater(...)` 切回 UI 线程；`onError` 包成 `Event.Failed` 走同一路径；`onComplete` 不处理（`Done` 由 `onNext` 提前发出）。
-- 新字段 `curTool: ToolDisplay`（执行中指示：`record ToolDisplay(String name, String args) {}`，非空即渲染执行行）。
-- `EventPump.handleEvent` 按 `sealed` 分派：
-    - `Event.Text(delta)`：追加 `curReply`，刷新 `streamingLabel`。
-    - `Event.Tool(t)` `phase==START`：若 `curReply` 非空，先把 preamble 作为 assistant 块写入 `scrollback` 并清空 `curReply`；置 `curTool = new ToolDisplay(t.name(), t.args())`。
-    - `Event.Tool(t)` `phase==END`：把 `View.toolLine(name,args)` 与 `View.toolResultSummary(result,isError)` 顺序追加到 `scrollback`；清 `curTool`。
-    - `Event.Done`：把 `curReply`（最终答复）经 `View.renderMarkdown` 写入 `scrollback`；`finishTurn`（停 spinner、回 IDLE）。
-    - `Event.Failed`：`scrollback` 追加 `View.errorBlock(err)`；`finishTurn`。
-- `View` 新增：`toolLine(name, args)`（青/绿 `●` + `name(args)` 的 Lanterna `Label`）、`toolResultSummary(result, isError)`（缩进 `  ⎿ `、灰/红，UI 截断 ~8 行）。`View.statusLine` 在 `curTool != null` 时渲染「`● name(args)` + spinner Running…」，否则沿用 Multi-turn 的「Imagining… (Ns)」。
-- 追加块的顺序由 `scrollback` Panel 的 `LinearLayout` 自然保序——只要 `invokeLater` 在 UI 线程同步依次 `addComponent`，preamble → 工具行 → 结果摘要 → 最终答复就按序出现。
+**`TuiApp` 新增字段：**
+- `Mode mode`——当前模式（默认 `Mode.NORMAL`），`/plan`、`/do` 切换，跨轮保持。
+- `int iter`——当前迭代轮次（进度显示），每 `Event.Iter` 更新，`finishTurn` 归零。
+- `long usageIn`、`long usageOut`——会话累计 token 用量，每个 `Event.UsageReport` 累加。
+- `List<ToolDisplay> curTools`——替换 ToolSystem 的单个 `ToolDisplay curTool`，支持并发批多个在执行的工具行。
+- `CancelToken turnCancel`——本轮取消句柄（每次 `submit` 重新建），Esc / Ctrl+C 触发；程序级退出走全局 shutdown hook。
+
+**`submit`（`StreamPump.java` 或 `TuiApp.onSubmit`）：**
+1. `/exit` → 退出（沿用）。
+2. `/plan` → `this.mode = Mode.PLAN`；提交一行提示块到 scrollback（如「已进入计划模式（只读工具）」）；回空闲态。
+3. `/do` → `this.mode = Mode.NORMAL`；`conv.addUser(Prompt.EXECUTE_DIRECTIVE)`；走与普通提交相同的启动流程（不把 `/do` 本身入历史）。
+4. 普通文本 → `conv.addUser(text)`。
+5. 启动：`this.turnCancel = new CancelToken()`；`Flow.Publisher<Event> events = new Agent(provider, registry).run(conv, this.mode, this.turnCancel)`；`state = SessionState.STREAMING`；`iter = 0`；用 `events.subscribe(new StreamPump(this))` 接管事件。
+
+**`StreamPump.onNext` 分派（用 switch pattern matching）：**
+按事件子类型分派——
+- `Event.Failed f` → 红色错误块入 scrollback、回 IDLE。
+- `Event.Tool t` →
+  - `Phase.START`：若 `curReply` 非空先把 preamble 提交 scrollback 并清空；`curTools.add(new ToolDisplay(name, args))`。
+  - `Phase.END`：**FIFO 弹出队首** `curTools.remove(0)`（因 agent 保证 START 与 END 都按调用序发出，结束序 == 入队序，弹首即对应工具，无需按 name 匹配，重名工具也不会错位）；用其 args 定型工具行，按序 append toolLine + toolResultSummary 到 scrollback。
+- `Event.UsageReport u` → `usageIn += u.usage().input(); usageOut += u.usage().output();`
+- `Event.Notice n` → 灰色系统提示块入 scrollback。
+- `Event.Iter i` → `this.iter = i.iter();`
+- `Event.Done` → 把 `curReply` 用 flexmark 渲染落 scrollback；`finishTurn()`。
+- `Event.TextDelta d` → 累积 `curReply`，刷新 streamingLabel。
+
+> Lanterna UI 线程切换：每个 onNext 内部都用 `gui.getGUIThread().invokeLater(() -> ...)` 把 UI 改动切回 GUI 线程，业务态字段（`iter`、`usageIn/usageOut`、`curTools`）也在 GUI 线程内变更——避免与渲染竞争（N6）。
+
+**按键（Lanterna `KeyStroke` 全局过滤）：**
+- `Ctrl+C`：`SessionState.STREAMING` → `turnCancel.cancel()`（取消本轮，不退出），继续等 onComplete；其余状态 → `screen.stopScreen(); System.exit(0)`（退出）。
+- `Esc`：`SessionState.STREAMING` → `turnCancel.cancel()`；其余忽略。
+
+**`View.java`：**
+- `statusBar`：左侧在 provider 名后附模式标记（`Mode.PLAN` 显示「PLAN」徽标）；右侧在 model 名旁附累计用量 `↑{in} ↓{out} tok`（数值用紧凑格式，如 `1.2k`）。保持单行。
+- 流式动态区：`curTools` 非空时逐行渲染 `● name(args)` + Running…（多个并发工具多行）；否则渲染「Imagining… (Ns · 第 N 轮)」（`iter>0` 时附轮次）。
+- `toolLine` / `toolResultSummary` 沿用 ToolSystem。
+
+**`finishTurn`：** 清 `curReply`、`curTools.clear()`、`iter=0`、`turnCancel=null`，回 `SessionState.IDLE`（`mode`、`usageIn/usageOut` 不清——跨轮保持）。
 
 ## 模块交互
 
 ```
-用户提交
-  └─ TuiApp.submit: conv.addUser(text); var pub = new Agent(provider, registry).run(conv); pub.subscribe(eventPump)
-       └─ Agent.run (virtual thread):
-            ├─ 请求#1: provider.stream(conv.messages(), registry.definitions())
-            │     └─ 适配器: 注入 tools → 流式 acc.accumulate → StreamEvent.TextDelta / StreamEvent.ToolCalls
-            │     → Agent 转发 Event.Text(preamble)，收集 calls
-            ├─ 无 calls → conv.addAssistant(preamble); Event.Done
-            └─ 有 calls:
-                 ├─ conv.addAssistantWithToolCalls(preamble, calls)
-                 ├─ for call: Event.Tool(START) → Future<Result> get(超时) → Event.Tool(END)
-                 ├─ conv.addToolResults(results)
-                 ├─ 请求#2: provider.stream(conv.messages(), defs) → Event.Text(最终答复)
-                 │     （适配器把 conv 里的 tool_use/tool_result 回合映射为各自协议格式）
-                 └─ conv.addAssistant(final); Event.Done
-  └─ EventPump.onNext → invokeLater → 按 sealed Event 变体渲染（curReply 动态区 / scrollback 追加块）
+用户提交 /do 或普通文本
+  └─ TuiApp.onSubmit:
+       ├─ /plan → mode=PLAN,回 IDLE
+       ├─ /do   → mode=NORMAL; conv.addUser(EXECUTE_DIRECTIVE)
+       ├─ 文本  → conv.addUser(text)
+       └─ turnCancel = new CancelToken();
+          events = new Agent(provider, registry).run(conv, mode, turnCancel)
+            └─ Agent.run (virtual thread, ReAct 循环):
+                 for iter:
+                   ├─ emit Iter
+                   ├─ 请求: provider.stream(conv.messages(), defs(mode), suffix(mode))
+                   │     └─ 适配器: 注入 tools + (SYSTEM_PROMPT+suffix) → 流式拼接
+                   │          → StreamEvent.TextDelta / ToolCalls / UsageEvent / Done|Failed
+                   │     → agent 转发 TextDelta(preamble)、收集 calls、记录 usage
+                   ├─ emit UsageReport
+                   ├─ 无 calls → conv.addAssistant(final); emit Done; 停
+                   └─ 有 calls:
+                        ├─ conv.addAssistantWithToolCalls(preamble, calls)
+                        ├─ executeBatched: 连续只读并发 / 有副作用串行
+                        │     (Start 事件按序 → 执行 → End 事件按序)
+                        ├─ conv.addToolResults(results)
+                        └─ 下一轮 iter
+  └─ StreamPump.onNext (pattern match):
+       TextDelta→curReply;Tool→curTools/scrollback;UsageReport→累加;
+       Iter→this.iter;Notice→灰提示;Done→提交最终答复+finishTurn
+  └─ Ctrl+C / Esc(streaming) → turnCancel.cancel() → run 收尾历史 → bus.close()
+       → StreamPump.onComplete → finishTurn → IDLE
 ```
 
-并发：`conv` 在每个时刻只被一个线程触碰——`submit` 在交给 `Agent.run` 前 `addUser`，之后不再触碰；virtual thread 独占后续所有 `conv` 变更。`messages()` 返回 `List.copyOf(...)` 不可变副本。TUI 仅按事件渲染，`curReply` 为自身显示缓冲，与 `conv` 互不干扰（N2）。
+并发模型：`conv` 任一时刻只被 `run` 的主虚拟线程触碰（`onSubmit` 在交给 `run` 前 `addUser`，之后不再触碰；执行批的工作线程只写各自 `results[k]`，不碰 `conv`）。`messages()` 返回不可变副本。TUI 仅按事件渲染。满足 N2/N6。
 
 ## 文件组织
 
 ```
 mewcode/
-├── pom.xml                                       — 修改：依赖与 Multi-turn 一致；新增模块不引入新坐标
+├── pom.xml                         — 修改：新增 JUnit `assertj`（可选）以便并发断言；其余依赖沿用
 ├── src/main/java/dev/mewcode/
-│   ├── Main.java                                 — 修改：构造 Registry.defaultRegistry() 注入 TuiApp
 │   ├── llm/
-│   │   ├── Message.java                          — 修改：增 toolCalls/toolResults 字段（保留便捷工厂）
-│   │   ├── StreamEvent.java                      — 修改：sealed 增 ToolCalls 变体
-│   │   ├── Provider.java                         — 修改：stream(...) 加 tools 参数
-│   │   ├── ToolCall.java                         — 新建：record
-│   │   ├── ToolResult.java                       — 新建：record
-│   │   ├── ToolDefinition.java                   — 新建：record
-│   │   ├── AnthropicProvider.java                — 修改：toAnthropicTools；MessageAccumulator 解析；stop_reason 上抛 ToolCalls；toAnthropicMessages 支持 tool_use/tool_result
-│   │   └── OpenAIProvider.java                   — 修改：toOpenAITools；ChatCompletionAccumulator 解析；finish_reason 上抛 ToolCalls；toOpenAIMessages 支持 assistant.tool_calls / tool 消息
-│   ├── tool/                                     — 新建
-│   │   ├── Tool.java                             — 接口
-│   │   ├── Result.java                           — record
-│   │   ├── ToolContext.java                      — record（cancelled 标志）
-│   │   ├── Registry.java                         — register/get/definitions/execute/defaultRegistry/DEFAULT_TIMEOUT
-│   │   ├── ReadFileTool.java
-│   │   ├── WriteFileTool.java
-│   │   ├── EditFileTool.java
-│   │   ├── BashTool.java
-│   │   ├── GlobTool.java
-│   │   ├── GrepTool.java
-│   │   └── Truncate.java                         — 工具函数：行/字节截断，尾部加 [truncated]
-│   ├── agent/                                    — 新建
-│   │   ├── Agent.java                            — run() 单轮闭环
-│   │   ├── Event.java                            — sealed Event
-│   │   ├── ToolEvent.java                        — record
-│   │   └── Phase.java                            — enum
+│   │   ├── StreamEvent.java        — 修改:sealed 新增 UsageEvent;新增 Usage record
+│   │   ├── Provider.java           — 修改:stream 加 systemSuffix 形参
+│   │   ├── AnthropicProvider.java  — 修改:effectiveSystem(suffix);流结束上抛 Usage
+│   │   └── OpenAIProvider.java     — 修改:streamOptions.includeUsage;toOpenAIMessages 拼 suffix;上抛 Usage
+│   ├── tool/
+│   │   ├── Tool.java               — 修改:接口加 readOnly()
+│   │   ├── Registry.java           — 修改:readOnlyDefinitions、isReadOnly
+│   │   └── {ReadFileTool,WriteFileTool,EditFileTool,BashTool,GlobTool,GrepTool}.java
+│   │                               — 修改:各加 readOnly() 实现
+│   ├── agent/
+│   │   ├── Agent.java              — 重写:ReAct 循环、Mode、executeBatched、UsageReport/Iter/Notice 事件、历史收尾
+│   │   ├── Event.java              — 修改:sealed 接口新增 UsageReport、Iter、Notice 子类型(以及 Usage record)
+│   │   ├── Mode.java               — 新增:enum {NORMAL, PLAN}
+│   │   └── CancelToken.java        — 新增:per-turn 取消句柄(volatile + 派生 timeout)
 │   ├── conversation/
-│   │   └── Conversation.java                     — 修改：addAssistantWithToolCalls、addToolResults
+│   │   └── Conversation.java       — 修改:lastRole()
 │   ├── prompt/
-│   │   └── Prompt.java                           — 修改：SYSTEM_PROMPT 增 Agent 角色与工具约定
+│   │   └── Prompt.java             — 修改:PLAN_MODE_REMINDER、EXECUTE_DIRECTIVE;SYSTEM_PROMPT 增循环约定
 │   └── tui/
-│       ├── TuiApp.java                           — 修改：构造接 registry；submit 走 Agent.run
-│       ├── EventPump.java                        — 新建（替代 Multi-turn 的 StreamPump）：Flow.Subscriber<agent.Event>
-│       └── View.java                             — 修改：toolLine / toolResultSummary；执行行渲染
-└── src/test/java/dev/mewcode/
-    ├── tool/RegistryTest.java                    — 注册中心 + 各工具单测
-    └── agent/AgentTest.java                      — fake Provider 驱动单轮闭环（AC8/AC9）
+│       ├── TuiApp.java             — 修改:字段增 mode/iter/usage/curTools/turnCancel;按键拆分 Esc/Ctrl+C
+│       ├── StreamPump.java         — 修改:onNext 用 switch pattern match 分派 UsageReport/Iter/Notice/Tool/Text
+│       └── View.java               — 修改:状态栏模式徽标+累计用量;动态区迭代轮次+多并发工具行
+├── src/test/java/dev/mewcode/
+│   ├── agent/AgentTest.java        — 扩展:多轮 fake provider(`List<List<StreamEvent>>` 多次 stream)、并发分批、停止条件、Plan 工具集
+│   └── conversation/ConversationTest.java
+│                                   — 扩展:lastRole 断言
+└── src/test/java/dev/mewcode/smoke/SmokeMain.java
+                                    — 修改:Agent.run 调用处补 mode 实参(Mode.NORMAL)
 ```
+
+> 注：`Main.java` 已在 ToolSystem 注入 `Registry`，AgentLoop 无需改动；`mode` 状态存于 `TuiApp`，不经 `Main`。
+
+### 签名变更的调用方清单（实测核对，确保编译不漏）
+
+AgentLoop 改了两个签名，必须同步所有调用方/实现方，否则编译断：
+
+- **`Provider.stream` 增 `String systemSuffix`（第 3 形参）**：
+  - 实现方：`AnthropicProvider`、`OpenAIProvider`。
+  - 调用方：`Agent.streamOnce`（唯一直接调用方）。
+  - 测试实现方：`AgentTest.FakeProvider#stream`（也实现该接口，签名须同步）。
+  - **`SmokeMain` 不直接调 `stream`**（它走 `Agent.run`），无需为 `systemSuffix` 改动。
+- **`Agent.run` 增 `Mode mode` 与 `CancelToken cancel`（新增第 2、3 形参）**：
+  - 调用方：`TuiApp` / `StreamPump` 内（`onSubmit`）、`SmokeMain`（旧调用 `agent.run(conv)`）、`AgentTest`（各用例）。三者都要补 `mode` / `cancel` 实参（smoke / 旧用例传 `Mode.NORMAL` + `new CancelToken()`）。
 
 ## 技术决策
 
 | 决策点 | 选择 | 理由 |
 |--------|------|------|
-| 工具调用循环放哪 | 新建 `dev.mewcode.agent` 包，TUI 退化为渲染器 | 循环（请求#1→执行→请求#2）无法塞进 Multi-turn 的一次性 `StreamPump.handleEvent`；独立包可无 UI 单测（AC8/AC9），只依赖 llm+tool+conversation，不泄漏 SDK 类型。命名 `agent` 而非 `runner`：概念即 Agent，本章恰为单轮。 |
-| 是否用 SDK 的 Beta tool-runner | 不用，坚持稳定 streaming + 手动单轮 | anthropic-java 的 `ToolRunner` 会自动连环到完成，违反 F6/AC9；且引入 Beta 类型与 Multi-turn stable 代码不一致。 |
-| 工具定义传入哪一层 | `Provider.stream` 第二参数 `List<ToolDefinition>` | 两 SDK 都把 tools 放 per-request params；续答仍需带；保持 Provider 无状态。 |
-| 工具参数 Schema 生成 | 每工具手写 `Map<String,Object>`（`LinkedHashMap` 保序） | OpenAI `FunctionParameters.fromMap(...)` 直接用；Anthropic 取 `"properties"`/`"required"`。6 个固定工具手写最直白，描述对模型可读性最关键；不引入 schema 生成库（带 `$id`/`$defs` 还要剥离）。 |
-| 流式工具参数拼接 | Anthropic 用 `MessageAccumulator`；OpenAI 用 `ChatCompletionAccumulator` 后读 `message().toolCalls()` | SDK 自带累加器处理分片，避免手写 PartialJSON / 按-index 拼接边界；OpenAI 不依赖 `JustFinishedToolCall`（多工具下不可靠）。 |
-| Glob/Grep 实现 | 纯 Java（`Files.walk` + 自实现 `**` / `java.util.regex`） | 零额外依赖、跨平台（Windows 无 grep/rg）；`PathMatcher` 的 `glob:**` 仅支持单层目录，必须自写。 |
-| Bash 实现与超时 | 按 `System.getProperty("os.name")` 选 shell（Unix `sh -c` / Windows `cmd /C`）+ `Process.waitFor(timeout)` 30s 超时 | `sh -c`/`cmd /C` 各自支持管道/重定向；`waitFor(timeout)` 超时 → `destroyForcibly()` 杀进程。30s 内置不可配（spec：超时不配置化）。跨平台兼容。stdout 用 virtual thread 异步读避免管道阻塞。 |
-| 工具失败的表达 | `execute` 返回 `Result(content, isError)`，从不抛 checked exception | F9/N4：所有失败包成结构化结果回灌，程序不崩，上层无需区分异常路径。 |
-| 工具结果在 Message 的形态 | 平铺 `List`（assistant 加 `toolCalls`，`Role.TOOL` 加 `toolResults`） | 两 SDK 工具语义本就是 id 关联的 tool_use/tool_result 列表；通用 content-block 联合属过度设计（本章结果均文本）。适配器吸收差异（Anthropic 结果进 user 消息、OpenAI 用 tool 角色）。 |
-| UI 截断 vs 回灌截断 | 两者分离：UI 摘要 ~8 行；回灌为工具级上限（read 2000 行 / bash 30000 字符 等） | AC11/N5 要界面截断，但模型需较完整内容；尾部统一加 `[truncated]` 标注。 |
-| 续答请求是否带 tools | 带，但忽略其返回的工具调用 | 与真实协议一致（OpenAI assistant+tool 后不带 tools 也可，但带更稳）；F6/AC9 由 Agent 不再触发执行来保证单轮。 |
-| thinking 与工具组合 | 历史含工具交互的请求（续答）不启用 thinking | Anthropic 在 thinking 启用时要求回灌带 tool_use 的 assistant 回合附原 thinking 块（含 signature），而本章按 spec 丢弃 thinking 增量、不留签名；故对这类请求关闭 thinking 以避免 400。 |
-| 空最终答复 | 续答为空（仅请求工具被丢弃 / 空完成）时用单轮提示占位并推给 UI | 空 assistant 回合会破坏下一轮请求（Anthropic 要求非空内容 + 角色交替）；占位提示同时满足 AC9 的"单轮上限提示"。 |
-| 空参数归一 | OpenAI 侧空 `arguments` 归一为 `"{}"` | 无参工具的 arguments 可能为空串，回灌时须是合法 JSON，否则严格兼容端点对 `"arguments":""` 返回 400。 |
-| grep 超长行 | 显式标注未完整搜索 | `Files.lines` 对 >1MB 行会 OOM 或被默认 charset decoder 拒掉；用 `BufferedReader` 限行长（如 1MB），溢出时跳过并尾部标注，避免假"无命中"误导模型。 |
-| scrollback 顺序提交 | `invokeLater` 内同步多次 `panel.addComponent(...)` | Lanterna `MultiWindowTextGUI` 的 GUI 线程是单线程串行执行 `invokeLater` 任务，一次任务里依次 `addComponent` 即可顺序追加，无需额外屏障。 |
-| 工具命名 | `read_file`/`write_file`/`edit_file`/`bash`/`glob`/`grep` | 符合 OpenAI 函数名规则（`a-zA-Z0-9_-`）与 Claude Code 习惯；TUI 工具行显示 `● name(关键参数)`。 |
+| Loop 放哪 | 重写 `Agent.run` 为循环，签名加 `mode` 与 `CancelToken` | 循环编排天然属 agent 包；TUI 维持纯渲染器。`run` 已返回事件 `Flow.Publisher`，循环只是把单轮的两次 `streamOnce` 推广为 `for`，改动收敛在一个包。 |
+| 不用 SDK 内置 tool-runner | 坚持手写循环 + stable streaming | 沿用 ToolSystem 决策；自写循环才能精确控制停止条件、保序分批、取消与历史收尾，SDK 的自动 runner 把这些黑盒化。 |
+| 停止条件之「连续未知工具」 | 连续 `MAX_UNKNOWN_RUN=3` 轮「整轮只产生未知工具调用」即停 | 单次未知工具靠 registry 的「未知工具」结构化错误回灌即可让模型纠偏；只有连续多轮全错才说明在对幻觉工具空转，需兜底。混入任一已注册工具即重置计数（视为有进展）。 |
+| 迭代上限值 | `MAX_ITERATIONS=25`，内置常量 | 兜底安全网，避免失控烧 token；25 足够覆盖正常多步任务。spec 明确不配置化，与 ToolSystem 超时不配化一致。 |
+| 并发分批粒度 | 「连续只读」合批并发，有副作用单个串行，保持调用序 | 用户选定的「保序分批」：read 之后的 write 不会被提前；相邻只读才并发加速。`BashTool` 保守归有副作用（可含任意写操作）。 |
+| 并发原语 | virtual thread + `CountDownLatch` + 每个 worker 独占下标 | virtual thread 起停成本极低、阻塞工具调用天然受益；只写自己下标的 `results[k]` 无需锁；`CountDownLatch` 在主流程汇合。备选 `StructuredTaskScope` 仍为 incubator，先不用。 |
+| 并发的事件顺序 | 开始事件按序、结束事件按序，并发只在执行环节 | 满足 N3（scrollback 不交错）：UI 看到的工具行顺序始终是模型调用序；并发对用户透明，只体现为更快。每个 worker 只写自己下标的 `results[k]`，无竞争（N6）。 |
+| 取消机制 | per-turn `CancelToken`；Esc / Ctrl+C(streaming) 取消，Ctrl+C(idle) 退出 | Java 没有 Go 的 ctx 树，自定义轻量 token（`volatile boolean cancelled` + 派生 timeout + 可选回调）即可表达「取消本轮但不退程序」语义。工具与 SDK 订阅在阻塞处轮询 / 调 `subscription.cancel()`。 |
+| 取消后历史一致 | 已发起工具补「已取消」结果 + `ensureAssistantTail` 收尾 | F6：取消可能停在「assistant 含 tool_use 但缺 tool_result」或「user 之后无 assistant」处；补齐工具结果 + 保证 assistant 文本尾巴，下一轮请求才不会因悬空 tool_use / 连续同角色被 API 拒（400）。 |
+| 用量提取位置 | 适配器在流结束后从累加器读 usage 并经 `StreamEvent.UsageEvent` 上抛 | 两 SDK 的流式 usage 都只在流结束的累加器里完整（Anthropic `MessageAccumulator.message().usage()`、OpenAI 需 `includeUsage=true` 后读累加器 `CompletionUsage`）；逐 delta 不含。统一在 Done 前发一次。 |
+| 累计用量口径 | 状态栏显示「会话累计计费 token」= 每轮 input+output 之和 | 多轮 Loop 每轮都重发完整历史，各轮 input 重复计费；按轮累加正是实际消耗/成本口径，对用户最有意义。 |
+| Plan Mode 系统提示注入 | `Provider.stream` 加 `String systemSuffix` 形参 | 系统提示在适配器内注入，要让计划态约束生效必须穿过 `stream`。加一个字符串形参最小且显式；备选「请求 options record」更可扩展但改动面更大，YAGNI 下不引入。 |
+| Plan Mode 工具集 | 计划态只注入 `readOnlyDefinitions()` | 物理上不给模型写/执行工具，即便提示被忽略也无法改动；只读分类靠 `Tool.readOnly()`。 |
+| `/do` 语义 | 切回 Normal + 注入 `EXECUTE_DIRECTIVE` 用户消息 + 立即启动 Loop | 用户选定「切回全工具并立即执行」；复用已在历史里的计划，`/do` 不入历史，只把执行指令作为用户消息驱动模型开干。 |
+| 模式状态存放 | 存于 `TuiApp`，不进 `Conversation` | `Conversation` 是历史、`messages()` 返回副本，放不住可变模式；模式是会话级 UI 状态，跨轮保持，归 TUI 最自然。 |
+| 多并发工具的 UI | `List<ToolDisplay> curTools` 取代单个 `ToolDisplay` | 并发批同时有多个工具在跑，动态区需多行展示；结束事件按序逐个落 scrollback。 |
+| 进度事件 | 每轮起始 emit `Event.Iter(n)`，UI 显示「第 N 轮」 | F9 让用户感知多轮推进；用 sealed 子类型分派，与 ToolSystem 的事件惯例一致。 |
+| 通知 vs 历史 | 上限/未知工具的提示同时 emit `Event.Notice` 与 `ensureAssistantTail` 写入 assistant 历史 | UI 要让用户看到为何停；写入历史是为满足 `ensureAssistantTail`（角色交替），二者用同一文案，避免历史里留空 assistant 回合。 |

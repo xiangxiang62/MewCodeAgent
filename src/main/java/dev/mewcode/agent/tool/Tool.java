@@ -9,5 +9,7 @@ public interface Tool {
 
     Map<String, Object> parameters();
 
+    boolean readOnly();
+
     Result execute(ToolContext context, String inputJson);
 }

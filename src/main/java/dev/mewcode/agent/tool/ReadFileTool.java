@@ -28,6 +28,11 @@ public final class ReadFileTool implements Tool {
     }
 
     @Override
+    public boolean readOnly() {
+        return true;
+    }
+
+    @Override
     public Result execute(ToolContext context, String inputJson) {
         try {
             JsonNode args = JsonArgs.parse(inputJson);

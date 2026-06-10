@@ -13,6 +13,8 @@ import dev.mewcode.agent.llm.ToolResult;
 import dev.mewcode.agent.llm.http.SseClient;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
@@ -93,7 +95,8 @@ public final class OpenAiProvider implements LlmProvider {
         int statusCode = connection.getResponseCode();
         if (statusCode < 200 || statusCode >= 300) {
             throw new IllegalStateException("OpenAI API request failed with HTTP " + statusCode
-                    + ", request id: " + valueOrUnknown(connection.getHeaderField("x-request-id")));
+                    + ", request id: " + valueOrUnknown(connection.getHeaderField("x-request-id"))
+                    + ", body: " + readErrorBody(connection));
         }
     }
 
@@ -184,6 +187,10 @@ public final class OpenAiProvider implements LlmProvider {
 
         try {
             JsonNode root = JSON.readTree(data);
+            JsonNode error = root.path("error");
+            if (!error.isMissingNode() && !error.isNull()) {
+                throw new IllegalStateException(formatStreamError(error));
+            }
             JsonNode content = root.at("/choices/0/delta/content");
             if (content.isTextual()) {
                 String text = content.asText();
@@ -238,6 +245,37 @@ public final class OpenAiProvider implements LlmProvider {
             }
         }
         return calls;
+    }
+
+    private String readErrorBody(HttpURLConnection connection) throws IOException {
+        InputStream errorStream = connection.getErrorStream();
+        if (errorStream == null) {
+            return "empty";
+        }
+        byte[] bytes = readFully(errorStream);
+        if (bytes.length == 0) {
+            return "empty";
+        }
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private String formatStreamError(JsonNode error) {
+        String code = error.path("code").asText("");
+        String message = error.path("message").asText(error.toString());
+        if (!code.isEmpty()) {
+            return "模型流式响应出错（code=" + code + "）: " + message;
+        }
+        return "模型流式响应出错: " + message;
+    }
+
+    private byte[] readFully(InputStream inputStream) throws IOException {
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        byte[] buffer = new byte[4096];
+        int read;
+        while ((read = inputStream.read(buffer)) != -1) {
+            outputStream.write(buffer, 0, read);
+        }
+        return outputStream.toByteArray();
     }
 
     private static final class ToolCallBuilder {

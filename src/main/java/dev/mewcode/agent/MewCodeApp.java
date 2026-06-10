@@ -46,6 +46,7 @@ public final class MewCodeApp {
         }
         List<ChatMessage> messages = new ArrayList<>();
         messages.add(new ChatMessage(Role.SYSTEM, Prompt.SYSTEM_PROMPT));
+        messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
         Registry registry = Registry.defaultRegistry();
 
         ChatConsole console = new ChatConsole("MewCode", configPath, config.llm());

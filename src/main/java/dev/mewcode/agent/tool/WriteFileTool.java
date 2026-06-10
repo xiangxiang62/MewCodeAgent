@@ -29,6 +29,11 @@ public final class WriteFileTool implements Tool {
     }
 
     @Override
+    public boolean readOnly() {
+        return false;
+    }
+
+    @Override
     public Result execute(ToolContext context, String inputJson) {
         try {
             JsonNode args = JsonArgs.parse(inputJson);

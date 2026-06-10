@@ -1,36 +1,43 @@
-# 工具系统 Checklist
+# Agent Loop Checklist
 
 > 每一项通过运行代码或观察行为来验证，聚焦系统行为；括号内为验证方式与对应需求。
 
 ## 实现完整性
-- [ ] 注册中心导出 6 条工具定义且按名可查（验证：`mvn -Dtest=RegistryTest#definitionsReturnsSixOrdered test`，断言 `definitions().size()==6`、名称有序、`get` 命中/未命中）。(AC1/F1)
-- [ ] read_file 带行号读出内容；读不存在/目录返回结构化错误（验证：单测 + 手测读 `docs/ToolSystem/spec.md` 见行号、读不存在文件得 isError）。(AC2/F2)
-- [ ] write_file 创建/覆盖文件，父目录自动创建（验证：单测用 `@TempDir` 写 `a/b/c.txt` 后 `Files.readString` 内容一致）。(AC3/F2)
-- [ ] edit_file 唯一匹配替换成功；0 处与 >1 处返回**可区分**错误（含匹配数）（验证：单测三情形，断言文案不同且 >1 含 N）。(AC4/F2)
-- [ ] bash 返回 stdout/退出码；超时命令被终止并返回超时结果（验证：单测 `echo hi` 命中输出；注入极短超时跑 `sleep` 得「命令超时」isError）。(AC5/F2/N1)
-- [ ] glob 列出匹配文件；grep 返回 `file:line:content`（验证：单测 `**/*.java` 命中、关键字 grep 命中）。(AC6/F2)
-- [ ] 流式工具调用解析正确：模型一次回复的工具名与完整 JSON 参数被拼齐（验证：端到端发「读 X 文件」，工具行参数与请求一致；或 AgentTest 断言 `inputJson` 完整）。(AC7/F4)
-- [ ] 单轮闭环端到端：问「读 X 并总结」→ 模型调用 read_file → 结果回灌 → 给出最终文本总结（验证：`java -jar target/mewcode-*.jar` 跑通，答复体现文件内容）。(AC8/F5/F6)
-- [ ] 单轮上限：需连续两步工具的任务，第一轮工具后即停、不发起第二轮工具执行（验证：AgentTest 脚本（b）断言只执行一轮；或端到端观察）。(AC9/F6)
-- [ ] 工具行 Claude Code 风格：对话区出现 `● name(关键参数)` + 缩进结果摘要，过长截断（验证：端到端跑一次工具任务，肉眼比对 + tmux 回滚见于 scrollback Panel）。(AC11/F8)
-- [ ] 工具失败结构化回灌且 UI 可区分、程序不退出（验证：读不存在文件 / edit 匹配不到 / bash 非零退出，各触发后再正常发一条）。(AC12/F9/N4)
+- [ ] 多轮自动连环：需要连续两步工具的任务，Agent 无需中途催促即自动多轮执行工具直到给出最终答复（验证：`mvn -q exec:java -Dexec.mainClass=dev.mewcode.Main` 或 `java -jar target/mewcode-*.jar` 跑「读 A 文件 → 据内容新建 B 文件」，观察 read_file 与 write_file 跨多轮依次出现、最终答复）。(AC1/F1)
+- [ ] 自然完成停止：模型给出无工具调用的纯文本即停（验证：`AgentTest` 场景 A 断言收到最终 `TextDelta` + `Done`，循环不再发起请求）。(AC2/F2)
+- [ ] 迭代上限兜底：模型反复调工具时达到 `MAX_ITERATIONS` 即停并提示，不无限循环（验证：`AgentTest` 场景 B 断言恰好上限轮后停 + `Notice(NOTICE_MAX_ITER)`）。(AC3/F2)
+- [ ] 连续未知工具停止：连续 `MAX_UNKNOWN_RUN` 轮只产生未知工具调用即停；混入已注册工具则计数重置（验证：`AgentTest` 场景 C 两路断言）。(AC4/F2)
+- [ ] 流出错恢复：provider 流出错时停止本轮、发 `Failed`、程序不退出（验证：端到端临时改坏 `base_url` 发一条，观察错误块 + 仍可继续；`AgentTest` 注入 `Failed` 脚本断言收到 `Failed` 后停）。(AC5/F2)
+- [ ] 事件流完备：Agent 对外事件含 `TextDelta` / 工具 Start / 工具 End / `UsageReport` / `Iter` / `Notice` / `Done` / `Failed`（验证：`AgentTest` 断言一次多轮运行收集到的事件子类型集合覆盖上述各类；端到端跑多轮任务，界面实时显示文本增量、工具进度、轮次、用量、最终答复，证明界面所需信息均来自事件流）。(AC6/F3)
+- [ ] 流式收集双路：文本实时显示的同时，完整工具调用（拼齐 JSON 参数）被收集用于下一轮（验证：`AgentTest` 断言 `ToolCall.input` 完整可解析；端到端工具行参数与请求一致）。(AC7/F4)
+- [ ] 保序分批并发：一次回复含多个工具时，连续只读并发执行、有副作用串行，结果按原序回灌（验证：`AgentTest` 场景 D 用插桩工具断言两只读的执行时间窗重叠（并发峰值≥2）、有副作用工具在其后开始、最终写入历史的工具结果顺序与模型调用序一致——按结果内容 / id 比对，与函数名无关）。(AC8/F5/N6)
+- [ ] 取消历史一致：执行中取消后历史配对合法（有 tool_results、末尾 assistant 文本、无悬空 tool_use）（验证：`AgentTest` 场景 E 断言 `conv` 序列；端到端取消后再发一条不报 400）。(AC9/F6)
+- [ ] 用户取消：流式态 Esc 或 Ctrl+C 中断本轮回空闲态、不退出；空闲态 Ctrl+C 退出（验证：端到端各按一次观察行为）。(AC10/F7)
+- [ ] 用量展示：状态栏显示会话累计 token（输入/输出），随轮次增长更新（验证：端到端跑多轮观察状态栏数值递增）。(AC11/F8)
+- [ ] 进度展示：流式态动态区显示当前迭代轮次（验证：端到端跑多轮任务观察「第 N 轮」递增）。(AC12/F9)
+- [ ] Plan Mode：`/plan` 后只出现只读工具与计划文本、无写/执行；`/do` 切回全工具并立即按计划执行（验证：端到端 Plan Mode 场景；`AgentTest` 场景 F 断言 `Mode.PLAN` 下 fake 收到的 tools 仅只读）。(AC13/F10)
 
 ## 集成
-- [ ] 两协议工具流程一致：anthropic 与 openai（含兼容 base_url）跑同一组工具任务，触发/展示/回灌/错误行为一致（验证：两种配置各跑「读 X 并总结」）。(AC10/F3/F7/N3)
-- [ ] 结果回灌进历史并被第二轮请求携带：assistant tool_use 回合 + tool_result 回合出现在续答上下文（验证：AgentTest 断言 `conv.messages()` 末尾序列；或抓请求体）。(F6)
-- [ ] 工具执行不阻塞界面：执行期间动态区显示 `● name(args)  Running…` 指示，界面可响应（验证：跑一个稍慢的 bash，观察界面持续刷新不冻结）。(N2)
-- [ ] scrollback 顺序正确：preamble 文本 → 工具行 → 结果摘要 → 最终答复 按序追加到 `scrollback` Panel 不交错（验证：多工具任务后回滚查看顺序；GUI 线程内同次 `invokeLater` 保序追加）。(F8)
-- [ ] 结果体量受控：读大文件 / 长输出 bash / 海量 grep 命中被工具级上限截断并标注 `[truncated]`，不撑爆界面/上下文（验证：读一个 >2000 行文件、跑长输出命令观察截断）。(AC13/N5)
-- [ ] 系统提示词体现 Agent 角色：问「你能做什么」答复提及可用工具能力（验证：发一条询问，观察答复）。(F3)
+- [ ] 跨协议一致：anthropic 与 openai（含兼容 `base_url`）跑同一多轮任务，触发/执行/回灌/用量/取消行为一致（验证：两种配置各跑多轮场景）。(AC14/F11/N3)
+- [ ] 多轮历史正确携带：每轮 assistant(tool_use) 回合 + tool_result 回合按序入历史并被下一轮请求携带（验证：`AgentTest` 断言 `conv` 末尾序列；或抓请求体见历史增长）。(F6)
+- [ ] 界面不阻塞：多轮循环与工具执行（含并发批）期间 spinner / 轮次 / 计时持续刷新（验证：跑含稍慢 bash 的任务，观察界面不冻结；virtual thread 跑工具与 SDK 流，UI 线程通过 `invokeLater` 更新）。(N2)
+- [ ] scrollback 顺序正确：跨多轮 preamble → 工具行 → 结果摘要 → 最终答复按序出现不交错，并发批的工具行按模型调用序排列（验证：跑一个含并发只读批 + 后续写的多轮任务，回滚 scrollback 肉眼核对各块严格按发生顺序连续、无交错、并发工具行顺序==调用序）。(N3)
+- [ ] 结果体量受控：大文件 / 长输出 / 海量命中被工具级上限截断标注 `[truncated]`，多轮累积不撑爆（验证：多轮中读大文件 / 跑长输出命令观察截断）。(N4)
+- [ ] 取消无泄漏：取消后无挂起 virtual thread / 无未关闭 `SubmissionPublisher`（验证：`mvn -q test -Dtest=AgentTest` 含取消用例（场景 E）通过；端到端反复触发取消后继续对话多次，进程内存 / 句柄稳定不增长，可用 `jcmd <pid> Thread.print | grep "Virtual"` 抽查）。(N5/N6)
+- [ ] 系统提示体现 Agent 循环：问「你能做什么」答复体现可多步使用工具完成任务（验证：发一条询问观察答复）。(F3)
 
 ## 编译与测试
 - [ ] `mvn -q -DskipTests package` 无错误（fat jar 可启动）。
-- [ ] `mvn spotless:check` 通过（如启用 google-java-format）。
-- [ ] `mvn test` 通过（`ConfigLoaderTest`、`ConversationTest`、`RegistryTest`、`AgentTest`）。
-- [ ] 密钥不回显/不打印：对话区与任何输出均不出现 `api_key`（验证：通读运行输出、检索无明文 key）。(N6)
+- [ ] `mvn -q test` 通过（`ConfigLoaderTest`、`ConversationTest`、`AgentTest`、`tool` 相关用例）。
+- [ ] `mvn -q test -Dtest='dev.mewcode.agent.*,dev.mewcode.tool.*'` 无失败（覆盖 N6 关键包，含并发场景 D / 取消场景 E）。
+- [ ] `mvn spotless:check` 通过（google-java-format 合规）。(N8)
+- [ ] 密钥不回显：对话区与任何输出均不出现 `api_key`（验证：通读运行输出、检索无明文 key）。(N7)
 
 ## 端到端场景
-- [ ] 场景 1（读文件并总结）：openai 兼容端点 → 问「读 docs/ToolSystem/spec.md 用一句话总结」→ `● read_file(...)` 工具行 + 结果摘要 + 最终 markdown 答复 → /exit 退出，终端无残留。
-- [ ] 场景 2（写/改/执行链路）：让模型「新建一个文件并写入内容，再用 bash 查看它」→ 观察 write_file 与 bash 工具行依次出现、结果正确（单轮内多工具顺序执行）。
-- [ ] 场景 3（错误恢复）：让模型 edit 一段不存在的文本 → 工具返回「未找到匹配」结构化错误、UI 红色提示、程序不退出 → 再正常发一条继续对话。
-- [ ] 场景 4（跨协议，若有 anthropic 配置）：切到 anthropic 配置重跑场景 1 → 工具触发/展示/回灌/答复行为与 openai 一致。
+- [ ] 场景 1（多轮连环）：openai 兼容端点 → 「读 `docs/ToolSystem/spec.md`，再据内容新建 `docs/ToolSystem/summary.txt` 写一句话摘要」→ read_file → write_file 跨多轮自动出现 → 状态栏用量增长、动态区轮次递增 → 最终答复 → `/exit` 无残留。
+- [ ] 场景 2（用户取消）：发一个多步任务，中途按 Esc（再试 Ctrl+C）→ 回空闲态不退出 → 再正常发一条继续对话（历史未坏，无 400）。
+- [ ] 场景 3（流出错恢复）：临时改坏 `base_url` 发一条 → 错误块 + 程序不退出 → 改回后继续正常对话。
+- [ ] 场景 4（Plan Mode）：`/plan` → 问一个改动类需求 → 只出现 read/glob/grep + 计划文本、无写/执行 → `/do` → 切回全工具并按计划执行（出现 write/edit/bash）。
+- [ ] 场景 5（跨协议，若有 anthropic 配置）：切到 anthropic 配置重跑场景 1 → 多轮行为与 openai 一致。
+- [ ] 场景 6（迭代上限）：主要由 `AgentTest` 场景 B 确定性验证；可选手动复现——临时把 `MAX_ITERATIONS` 改小（如 3）跑一个会多步调工具的任务，观察第 3 轮后停并显示 `NOTICE_MAX_ITER`、之后仍可继续对话。
+- [ ] 场景 7（连续未知工具）：主要由 `AgentTest` 场景 C 确定性验证；可选手动复现——在 system prompt 临时引导模型调用一个不存在的工具名，观察连续 `MAX_UNKNOWN_RUN` 轮后停并显示 `NOTICE_UNKNOWN_TOOLS`、之后仍可继续对话。

@@ -38,6 +38,22 @@ public final class Registry {
         return definitions;
     }
 
+    public List<ToolDefinition> readOnlyDefinitions() {
+        List<ToolDefinition> definitions = new ArrayList<>();
+        for (String name : order) {
+            Tool tool = tools.get(name);
+            if (tool.readOnly()) {
+                definitions.add(new ToolDefinition(tool.name(), tool.description(), tool.parameters()));
+            }
+        }
+        return definitions;
+    }
+
+    public boolean isReadOnly(String name) {
+        Tool tool = tools.get(name);
+        return tool != null && tool.readOnly();
+    }
+
     public Result execute(ToolContext context, String name, String args) {
         Tool tool = tools.get(name);
         if (tool == null) {
