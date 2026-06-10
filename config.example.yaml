@@ -1,0 +1,13 @@
+llm:
+  # openai | anthropic
+  protocol: openai
+  model: gpt-4.1-mini
+  base_url: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  max_tokens: 4096
+
+  # Anthropic Claude only.
+  # thinking:
+  #   enabled: true
+  #   budget_tokens: 1024
+  #   display: omitted

@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<testsuite tests="2" failures="0" name="dev.mewcode.agent.config.ConfigLoaderTest" time="0.438" errors="0" skipped="0">
+  <properties>
+    <property name="java.runtime.name" value="OpenJDK Runtime Environment"/>
+    <property name="sun.boot.library.path" value="D:\DevEnvironment\JDK\jdk8\jre\bin"/>
+    <property name="java.vm.version" value="25.422-b05"/>
+    <property name="java.vm.vendor" value="Amazon.com Inc."/>
+    <property name="maven.multiModuleProjectDirectory" value="D:\AI-Project\MewcodeAgent"/>
+    <property name="java.vendor.url" value="https://aws.amazon.com/corretto/"/>
+    <property name="path.separator" value=";"/>
+    <property name="guice.disable.misplaced.annotation.check" value="true"/>
+    <property name="java.vm.name" value="OpenJDK 64-Bit Server VM"/>
+    <property name="file.encoding.pkg" value="sun.io"/>
+    <property name="user.script" value=""/>
+    <property name="user.country" value="CN"/>
+    <property name="sun.java.launcher" value="SUN_STANDARD"/>
+    <property name="sun.os.patch.level" value=""/>
+    <property name="java.vm.specification.name" value="Java Virtual Machine Specification"/>
+    <property name="user.dir" value="D:\AI-Project\MewcodeAgent"/>
+    <property name="java.runtime.version" value="1.8.0_422-b05"/>
+    <property name="java.awt.graphicsenv" value="sun.awt.Win32GraphicsEnvironment"/>
+    <property name="java.endorsed.dirs" value="D:\DevEnvironment\JDK\jdk8\jre\lib\endorsed"/>
+    <property name="os.arch" value="amd64"/>
+    <property name="java.io.tmpdir" value="C:\Users\19643\AppData\Local\Temp\"/>
+    <property name="line.separator" value="
+"/>
+    <property name="java.vm.specification.vendor" value="Oracle Corporation"/>
+    <property name="user.variant" value=""/>
+    <property name="os.name" value="Windows 11"/>
+    <property name="classworlds.conf" value="D:\DevEnvironment\Maven\apache-maven-3.8.8\bin\m2.conf"/>
+    <property name="sun.jnu.encoding" value="GBK"/>
+    <property name="java.library.path" value="D:\DevEnvironment\JDK\jdk8\bin;C:\WINDOWS\Sun\Java\bin;C:\WINDOWS\system32;C:\WINDOWS;E:\vm\bin\;E:\app\19643\product\12.2.0\dbhome_1\bin;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WINDOWS\System32\WindowsPowerShell\v1.0\;C:\WINDOWS\System32\OpenSSH\;D:\DevEnvironment\Maven\apache-maven-3.8.8\bin;D:\DevEnvironment\JDK\jdk8\bin;D:\DevEnvironment\Git\cmd;D:\DevEnvironment\Redis\;C:\WINDOWS\system32\downlevel;C:\Program Files\MySQL\MySQL Server 8.0\bin;D:\DevEnvironment\nvm\nvm;C:\nvm4w\nodejs;C:\Users\19643\AppData\Local\Programs\Python\Python311\Scripts\;C:\Users\19643\AppData\Local\Programs\Python\Python311\;C:\Users\19643\AppData\Local\Microsoft\WindowsApps;D:\DevEnvironment\vscode\Microsoft VS Code\bin;C:\Users\19643\AppData\Roaming\npm;D:\cursor\resources\app\bin;D:\DevEnvironment\nvm\nvm;C:\nvm4w\nodejs;."/>
+    <property name="maven.conf" value="D:\DevEnvironment\Maven\apache-maven-3.8.8/conf"/>
+    <property name="java.specification.name" value="Java Platform API Specification"/>
+    <property name="java.class.version" value="52.0"/>
+    <property name="sun.management.compiler" value="HotSpot 64-Bit Tiered Compilers"/>
+    <property name="os.version" value="10.0"/>
+    <property name="library.jansi.path" value="D:\DevEnvironment\Maven\apache-maven-3.8.8\lib\jansi-native"/>
+    <property name="user.home" value="C:\Users\19643"/>
+    <property name="user.timezone" value="Asia/Shanghai"/>
+    <property name="java.awt.printerjob" value="sun.awt.windows.WPrinterJob"/>
+    <property name="java.specification.version" value="1.8"/>
+    <property name="file.encoding" value="GBK"/>
+    <property name="user.name" value="19643"/>
+    <property name="java.class.path" value="D:\DevEnvironment\Maven\apache-maven-3.8.8\boot\plexus-classworlds-2.6.0.jar"/>
+    <property name="java.vm.specification.version" value="1.8"/>
+    <property name="sun.arch.data.model" value="64"/>
+    <property name="java.home" value="D:\DevEnvironment\JDK\jdk8\jre"/>
+    <property name="sun.java.command" value="org.codehaus.plexus.classworlds.launcher.Launcher package"/>
+    <property name="java.specification.vendor" value="Oracle Corporation"/>
+    <property name="user.language" value="zh"/>
+    <property name="awt.toolkit" value="sun.awt.windows.WToolkit"/>
+    <property name="java.vm.info" value="mixed mode"/>
+    <property name="java.version" value="1.8.0_422"/>
+    <property name="java.ext.dirs" value="D:\DevEnvironment\JDK\jdk8\jre\lib\ext;C:\WINDOWS\Sun\Java\lib\ext"/>
+    <property name="sun.boot.class.path" value="D:\DevEnvironment\JDK\jdk8\jre\lib\resources.jar;D:\DevEnvironment\JDK\jdk8\jre\lib\rt.jar;D:\DevEnvironment\JDK\jdk8\jre\lib\sunrsasign.jar;D:\DevEnvironment\JDK\jdk8\jre\lib\jsse.jar;D:\DevEnvironment\JDK\jdk8\jre\lib\jce.jar;D:\DevEnvironment\JDK\jdk8\jre\lib\charsets.jar;D:\DevEnvironment\JDK\jdk8\jre\lib\jfr.jar;D:\DevEnvironment\JDK\jdk8\jre\classes"/>
+    <property name="sun.stderr.encoding" value="ms936"/>
+    <property name="java.vendor" value="Amazon.com Inc."/>
+    <property name="java.specification.maintenance.version" value="5"/>
+    <property name="maven.home" value="D:\DevEnvironment\Maven\apache-maven-3.8.8"/>
+    <property name="file.separator" value="\"/>
+    <property name="java.vendor.url.bug" value="https://github.com/corretto/corretto-8/issues/"/>
+    <property name="sun.cpu.endian" value="little"/>
+    <property name="sun.io.unicode.encoding" value="UnicodeLittle"/>
+    <property name="sun.stdout.encoding" value="ms936"/>
+    <property name="sun.desktop" value="windows"/>
+    <property name="sun.cpu.isalist" value="amd64"/>
+  </properties>
+  <testcase classname="dev.mewcode.agent.config.ConfigLoaderTest" name="loadsRequiredLlmFields" time="0.437"/>
+  <testcase classname="dev.mewcode.agent.config.ConfigLoaderTest" name="reportsMissingRequiredField" time="0.001"/>
+</testsuite>
