@@ -1,8 +1,10 @@
 package dev.mewcode.agent.llm;
 
 public enum Role {
+    SYSTEM("system"),
     USER("user"),
-    ASSISTANT("assistant");
+    ASSISTANT("assistant"),
+    TOOL("tool");
 
     private final String wireName;
 

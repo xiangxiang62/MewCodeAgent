@@ -4,8 +4,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.mewcode.agent.config.LlmConfig;
 import dev.mewcode.agent.llm.ChatMessage;
+import dev.mewcode.agent.llm.ChatResponse;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.StreamCallback;
+import dev.mewcode.agent.llm.ToolCall;
+import dev.mewcode.agent.llm.ToolDefinition;
+import dev.mewcode.agent.llm.ToolResult;
 import dev.mewcode.agent.llm.http.SseClient;
 
 import java.io.IOException;
@@ -20,6 +24,8 @@ import java.util.Map;
 
 public final class OpenAiProvider implements LlmProvider {
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final boolean DEBUG_TOOL_CALLS = Boolean.parseBoolean(
+            System.getenv().getOrDefault("MEWCODE_DEBUG_TOOL_CALLS", "false"));
 
     private final LlmConfig config;
 
@@ -39,17 +45,25 @@ public final class OpenAiProvider implements LlmProvider {
      * 调用 OpenAI Chat Completions 流式接口，并把文本增量回调给终端层。
      */
     @Override
-    public String streamChat(List<ChatMessage> messages, StreamCallback callback) throws Exception {
+    public ChatResponse streamChat(List<ChatMessage> messages, List<ToolDefinition> tools, StreamCallback callback) throws Exception {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("model", config.model());
+        payload.put("max_tokens", config.effectiveMaxTokens());
         payload.put("stream", true);
         payload.put("messages", toWireMessages(messages));
+        if (tools != null && !tools.isEmpty()) {
+            payload.put("tools", toWireTools(tools));
+            payload.put("tool_choice", "auto");
+            payload.put("parallel_tool_calls", false);
+        }
+        debug("OpenAI request payload: " + redactSecrets(JSON.writeValueAsString(payload)));
 
         HttpURLConnection connection = openConnection(endpoint(), JSON.writeValueAsString(payload));
         ensureSuccess(connection);
         StringBuilder fullText = new StringBuilder();
-        SseClient.consume(connection.getInputStream(), data -> handleData(data, callback, fullText));
-        return fullText.toString();
+        Map<Integer, ToolCallBuilder> toolCalls = new LinkedHashMap<>();
+        SseClient.consume(connection.getInputStream(), data -> handleData(data, callback, fullText, toolCalls));
+        return new ChatResponse(fullText.toString(), buildToolCalls(toolCalls));
     }
 
     /**
@@ -104,12 +118,55 @@ public final class OpenAiProvider implements LlmProvider {
     /**
      * 将内部消息结构转换为 OpenAI API 接收的 messages 数组。
      */
-    private List<Map<String, String>> toWireMessages(List<ChatMessage> messages) {
-        List<Map<String, String>> wire = new ArrayList<>();
+    private List<Map<String, Object>> toWireMessages(List<ChatMessage> messages) {
+        List<Map<String, Object>> wire = new ArrayList<>();
         for (ChatMessage message : messages) {
-            Map<String, String> item = new LinkedHashMap<>();
-            item.put("role", message.role().wireName());
-            item.put("content", message.content());
+            if (message.role() == dev.mewcode.agent.llm.Role.TOOL) {
+                for (ToolResult result : message.toolResults()) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("role", "tool");
+                    item.put("tool_call_id", result.toolCallId());
+                    item.put("content", result.content());
+                    wire.add(item);
+                }
+            } else {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("role", message.role().wireName());
+                item.put("content", message.content());
+                if (!message.toolCalls().isEmpty()) {
+                    item.put("tool_calls", toOpenAiToolCalls(message.toolCalls()));
+                }
+                wire.add(item);
+            }
+        }
+        return wire;
+    }
+
+    private List<Map<String, Object>> toWireTools(List<ToolDefinition> tools) {
+        List<Map<String, Object>> wire = new ArrayList<>();
+        for (ToolDefinition tool : tools) {
+            Map<String, Object> function = new LinkedHashMap<>();
+            function.put("name", tool.name());
+            function.put("description", tool.description());
+            function.put("parameters", tool.inputSchema());
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("type", "function");
+            item.put("function", function);
+            wire.add(item);
+        }
+        return wire;
+    }
+
+    private List<Map<String, Object>> toOpenAiToolCalls(List<ToolCall> calls) {
+        List<Map<String, Object>> wire = new ArrayList<>();
+        for (ToolCall call : calls) {
+            Map<String, Object> function = new LinkedHashMap<>();
+            function.put("name", call.name());
+            function.put("arguments", call.inputJson());
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", call.id());
+            item.put("type", "function");
+            item.put("function", function);
             wire.add(item);
         }
         return wire;
@@ -118,10 +175,12 @@ public final class OpenAiProvider implements LlmProvider {
     /**
      * 解析 OpenAI SSE data，提取 choices[0].delta.content 文本增量。
      */
-    private void handleData(String data, StreamCallback callback, StringBuilder fullText) {
+    private void handleData(String data, StreamCallback callback, StringBuilder fullText,
+                            Map<Integer, ToolCallBuilder> toolCalls) {
         if ("[DONE]".equals(data)) {
             return;
         }
+        debug("OpenAI SSE data: " + data);
 
         try {
             JsonNode root = JSON.readTree(data);
@@ -131,8 +190,59 @@ public final class OpenAiProvider implements LlmProvider {
                 fullText.append(text);
                 callback.onText(text);
             }
+            JsonNode toolCallNodes = root.at("/choices/0/delta/tool_calls");
+            if (toolCallNodes.isArray()) {
+                for (JsonNode node : toolCallNodes) {
+                    int index = node.path("index").asInt();
+                    ToolCallBuilder builder = toolCalls.computeIfAbsent(index, ignored -> new ToolCallBuilder());
+                    if (node.path("id").isTextual()) {
+                        String id = node.path("id").asText();
+                        if (!id.isEmpty()) {
+                            builder.id = id;
+                        }
+                    }
+                    JsonNode function = node.path("function");
+                    if (function.path("name").isTextual()) {
+                        String name = function.path("name").asText();
+                        if (!name.isEmpty()) {
+                            builder.name = name;
+                        }
+                    }
+                    if (function.path("arguments").isTextual()) {
+                        builder.arguments.append(function.path("arguments").asText());
+                    }
+                }
+            }
         } catch (Exception e) {
             throw new IllegalStateException("Failed to parse OpenAI SSE data: " + data, e);
         }
+    }
+
+    private void debug(String message) {
+        if (DEBUG_TOOL_CALLS) {
+            System.err.println("[MewCode][OpenAI] " + message);
+        }
+    }
+
+    private String redactSecrets(String json) {
+        return json.replace(config.apiKey(), "***");
+    }
+
+    private List<ToolCall> buildToolCalls(Map<Integer, ToolCallBuilder> builders) {
+        List<ToolCall> calls = new ArrayList<>();
+        for (Map.Entry<Integer, ToolCallBuilder> entry : builders.entrySet()) {
+            ToolCallBuilder builder = entry.getValue();
+            if (builder.name != null && !builder.name.isEmpty()) {
+                String id = builder.id == null || builder.id.isEmpty() ? "call_" + entry.getKey() : builder.id;
+                calls.add(new ToolCall(id, builder.name, builder.arguments.toString()));
+            }
+        }
+        return calls;
+    }
+
+    private static final class ToolCallBuilder {
+        private String id;
+        private String name;
+        private final StringBuilder arguments = new StringBuilder();
     }
 }

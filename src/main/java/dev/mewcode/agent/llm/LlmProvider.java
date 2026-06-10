@@ -13,5 +13,5 @@ public interface LlmProvider {
      *
      * @return 本轮完整助手回复，用于追加到会话历史中。
      */
-    String streamChat(List<ChatMessage> messages, StreamCallback callback) throws Exception;
+    ChatResponse streamChat(List<ChatMessage> messages, List<ToolDefinition> tools, StreamCallback callback) throws Exception;
 }

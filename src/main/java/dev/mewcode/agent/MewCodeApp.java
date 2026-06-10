@@ -5,6 +5,9 @@ import dev.mewcode.agent.config.ConfigLoader;
 import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.LlmProviderFactory;
+import dev.mewcode.agent.llm.Role;
+import dev.mewcode.agent.prompt.Prompt;
+import dev.mewcode.agent.tool.Registry;
 import dev.mewcode.agent.ui.ChatConsole;
 
 import java.nio.file.Files;
@@ -42,9 +45,11 @@ public final class MewCodeApp {
             return;
         }
         List<ChatMessage> messages = new ArrayList<>();
+        messages.add(new ChatMessage(Role.SYSTEM, Prompt.SYSTEM_PROMPT));
+        Registry registry = Registry.defaultRegistry();
 
         ChatConsole console = new ChatConsole("MewCode", configPath, config.llm());
-        console.run(messages, provider);
+        console.run(messages, provider, registry);
     }
 
     /**
