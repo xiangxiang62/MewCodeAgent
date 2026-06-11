@@ -11,6 +11,10 @@ import dev.mewcode.agent.llm.StreamCallback;
 import dev.mewcode.agent.llm.ToolCall;
 import dev.mewcode.agent.llm.ToolDefinition;
 import dev.mewcode.agent.llm.ToolResult;
+import dev.mewcode.agent.permission.Decision;
+import dev.mewcode.agent.permission.Mode;
+import dev.mewcode.agent.permission.Outcome;
+import dev.mewcode.agent.permission.PermissionEngine;
 import dev.mewcode.agent.prompt.EnvironmentInfo;
 import dev.mewcode.agent.prompt.Prompt;
 import dev.mewcode.agent.prompt.Reminder;
@@ -22,47 +26,44 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 串联模型、工具和会话历史的主执行器。
+ * 串联模型、工具、权限系统和会话历史的主执行器。
  */
 public final class ToolAgent {
-    /**
-     * 代理当前所处的执行模式。
-     */
-    public enum Mode {
-        NORMAL,
-        PLAN
-    }
-
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final boolean DEBUG_TOOL_CALLS = Boolean.parseBoolean(
             System.getenv().getOrDefault("MEWCODE_DEBUG_TOOL_CALLS", "false"));
-    private static final int MAX_ITERATIONS = 12;
+    private static final int MAX_ITERATIONS = 25;
     private static final int MAX_UNKNOWN_ROUNDS = 3;
-    private static final int MAX_REPEATED_PLAN_ROUNDS = 2;
-    private static final int PLAN_REMINDER_INTERVAL = 4;
 
     private final LlmProvider provider;
     private final Registry registry;
+    private final PermissionEngine permissionEngine;
+    private final ApprovalHandler approvalHandler;
 
     /**
      * 创建一个代理实例。
      */
-    public ToolAgent(LlmProvider provider, Registry registry) {
+    public ToolAgent(LlmProvider provider, Registry registry, PermissionEngine permissionEngine,
+            ApprovalHandler approvalHandler) {
         this.provider = provider;
         this.registry = registry;
+        this.permissionEngine = permissionEngine;
+        this.approvalHandler = approvalHandler;
     }
 
     /**
-     * 以普通模式运行一轮代理流程。
+     * 以默认模式运行一轮代理流程。
      */
     public String run(List<ChatMessage> messages, StreamCallback callback, ToolDisplay display) throws Exception {
-        return run(messages, callback, display, Mode.NORMAL);
+        return run(messages, callback, display, Mode.DEFAULT);
     }
 
     /**
@@ -71,16 +72,13 @@ public final class ToolAgent {
     public String run(List<ChatMessage> messages, StreamCallback callback, ToolDisplay display, Mode mode)
             throws Exception {
         int unknownRounds = 0;
-        String previousPlanSignature = null;
-        int repeatedPlanRounds = 0;
-        boolean emptyWorkspaceDetected = hasEmptyWorkspaceMarker(messages);
         String systemPrompt = Prompt.buildSystemPrompt();
         String environmentInfo = EnvironmentInfo.gather("0.1.0-SNAPSHOT", provider.model()).render();
 
         for (int iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-            debug("starting iteration " + iteration + " in mode " + mode);
-            List<ToolDefinition> definitions = selectDefinitions(mode, emptyWorkspaceDetected);
-            String reminder = buildReminder(mode, emptyWorkspaceDetected, iteration);
+            debug("starting iteration " + iteration + " in mode " + mode.displayName());
+            List<ToolDefinition> definitions = selectDefinitions(mode);
+            String reminder = buildReminder(mode);
             ChatResponse response = provider.streamChat(
                     new LlmRequest(buildRequestMessages(messages), definitions, systemPrompt, environmentInfo, reminder),
                     callback);
@@ -97,27 +95,6 @@ public final class ToolAgent {
                     Collections.<ToolResult>emptyList()));
             List<ToolResult> results = executeCalls(toolCalls, display, mode);
             messages.add(new ChatMessage(Role.TOOL, "", Collections.<ToolCall>emptyList(), results));
-
-            if (mode == Mode.PLAN) {
-                if (looksLikeEmptyWorkspace(toolCalls, results)) {
-                    emptyWorkspaceDetected = true;
-                    addEmptyWorkspaceMarker(messages);
-                }
-
-                String currentSignature = buildPlanSignature(toolCalls, results);
-                if (currentSignature.equals(previousPlanSignature)) {
-                    repeatedPlanRounds++;
-                } else {
-                    repeatedPlanRounds = 0;
-                    previousPlanSignature = currentSignature;
-                }
-                if (repeatedPlanRounds >= MAX_REPEATED_PLAN_ROUNDS - 1) {
-                    String notice = "计划模式下检测到重复的只读探测，当前工作区信息不足；请直接给出计划，或用 /do 开始执行。";
-                    callback.onText(notice);
-                    messages.add(new ChatMessage(Role.ASSISTANT, notice));
-                    return notice;
-                }
-            }
 
             if (allUnknown(toolCalls)) {
                 unknownRounds++;
@@ -146,69 +123,23 @@ public final class ToolAgent {
     }
 
     /**
-     * 生成本轮 reminder；计划模式和空工作区提示会在这里合并。
+     * 生成本轮 reminder。
      */
-    private String buildReminder(Mode mode, boolean emptyWorkspaceDetected, int iteration) {
-        List<String> parts = new ArrayList<String>();
+    private String buildReminder(Mode mode) {
         if (mode == Mode.PLAN) {
-            boolean full = iteration == 1 || ((iteration - 1) % PLAN_REMINDER_INTERVAL == 0);
-            parts.add(Reminder.plan(full));
+            return Reminder.plan(true);
         }
-        if (emptyWorkspaceDetected) {
-            parts.add(Reminder.systemReminder(Prompt.EMPTY_WORKSPACE_REMINDER));
-        }
-        return joinNonEmpty(parts);
-    }
-
-    /**
-     * 用空行拼接非空文本段。
-     */
-    private String joinNonEmpty(List<String> parts) {
-        StringBuilder builder = new StringBuilder();
-        for (String part : parts) {
-            if (part == null || part.trim().isEmpty()) {
-                continue;
-            }
-            if (builder.length() > 0) {
-                builder.append("\n\n");
-            }
-            builder.append(part.trim());
-        }
-        return builder.toString();
+        return "";
     }
 
     /**
      * 根据模式选择当前轮允许模型调用的工具集合。
      */
-    private List<ToolDefinition> selectDefinitions(Mode mode, boolean emptyWorkspaceDetected) {
+    private List<ToolDefinition> selectDefinitions(Mode mode) {
         if (mode == Mode.PLAN) {
-            if (emptyWorkspaceDetected) {
-                return Collections.emptyList();
-            }
             return registry.readOnlyDefinitions();
         }
         return registry.definitions();
-    }
-
-    /**
-     * 检查会话历史里是否已经记录过空工作区标记。
-     */
-    private boolean hasEmptyWorkspaceMarker(List<ChatMessage> messages) {
-        for (ChatMessage message : messages) {
-            if (message.role() == Role.SYSTEM && Prompt.EMPTY_WORKSPACE_MARKER.equals(message.content())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 向会话历史补充空工作区标记，避免后续重复探测。
-     */
-    private void addEmptyWorkspaceMarker(List<ChatMessage> messages) {
-        if (!hasEmptyWorkspaceMarker(messages)) {
-            messages.add(new ChatMessage(Role.SYSTEM, Prompt.EMPTY_WORKSPACE_MARKER));
-        }
     }
 
     /**
@@ -225,7 +156,7 @@ public final class ToolAgent {
     }
 
     /**
-     * 判断本轮工具调用是否全部未注册。
+     * 判断本轮工具调用是否全部未知。
      */
     private boolean allUnknown(List<ToolCall> calls) {
         for (ToolCall call : calls) {
@@ -237,32 +168,157 @@ public final class ToolAgent {
     }
 
     /**
-     * 顺序执行本轮工具调用，并把结果转换成模型可消费的结构。
+     * 执行本轮工具调用，并把结果转换成模型可消费的结构。
      */
     private List<ToolResult> executeCalls(List<ToolCall> calls, ToolDisplay display, Mode mode) {
-        List<ToolResult> results = new ArrayList<ToolResult>();
-        for (ToolCall call : calls) {
-            String args = previewArgs(call);
-            debug("executing tool " + call.name() + " with args " + args);
-            display.onToolStart(call.name(), args);
-            Result result;
-            if (mode == Mode.PLAN && !registry.isReadOnly(call.name())) {
-                result = Result.error("计划模式下禁止执行非只读工具: " + call.name());
+        List<ToolResult> results = new ArrayList<ToolResult>(Collections.nCopies(calls.size(), (ToolResult) null));
+        int index = 0;
+        while (index < calls.size()) {
+            ToolCall call = calls.get(index);
+            if (canRunReadOnlyBatch(call, mode)) {
+                index = executeReadOnlyBatch(calls, results, display, mode, index);
             } else {
-                result = executeWithTimeout(call);
+                executeSingleCall(calls, results, display, mode, index);
+                index++;
             }
-            display.onToolEnd(call.name(), args, result.content(), result.isError());
-            results.add(new ToolResult(call.id(), result.content(), result.isError()));
         }
         return results;
     }
 
     /**
+     * 仅在非计划模式下，把连续只读工具归并成一批并发执行。
+     */
+    private boolean canRunReadOnlyBatch(ToolCall call, Mode mode) {
+        return mode != Mode.PLAN && registry.isReadOnly(call.name());
+    }
+
+    /**
+     * 并发执行一段连续只读工具，同时保证展示顺序和结果回灌顺序不变。
+     */
+    private int executeReadOnlyBatch(List<ToolCall> calls, List<ToolResult> results, ToolDisplay display, Mode mode,
+            int start) {
+        int end = start;
+        while (end < calls.size() && canRunReadOnlyBatch(calls.get(end), mode)) {
+            end++;
+        }
+
+        final String[] previews = new String[end - start];
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        for (int i = start; i < end; i++) {
+            previews[i - start] = previewArgs(calls.get(i));
+            display.onToolStart(calls.get(i).name(), previews[i - start]);
+            PermissionEngine.CheckResult check = permissionEngine.check(mode, calls.get(i), true);
+            if (check.decision() == Decision.DENY) {
+                results.set(i, new ToolResult(calls.get(i).id(), check.reason(), true));
+            }
+        }
+
+        final CountDownLatch latch = new CountDownLatch(countRunnableReads(results, start, end));
+        for (int i = start; i < end; i++) {
+            if (results.get(i) != null) {
+                continue;
+            }
+            final int currentIndex = i;
+            Thread worker = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        ToolCall call = calls.get(currentIndex);
+                        Result result = runToolCall(call, mode, cancelled);
+                        results.set(currentIndex, new ToolResult(call.id(), result.content(), result.isError()));
+                    } finally {
+                        latch.countDown();
+                    }
+                }
+            }, "mewcode-readonly-tool-" + i);
+            worker.setDaemon(true);
+            worker.start();
+        }
+
+        try {
+            if (latch.getCount() > 0) {
+                latch.await();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        for (int i = start; i < end; i++) {
+            ToolCall call = calls.get(i);
+            ToolResult result = results.get(i);
+            if (result == null) {
+                result = new ToolResult(call.id(), "工具执行失败: 未收集到结果", true);
+                results.set(i, result);
+            }
+            display.onToolEnd(call.name(), previews[i - start], result.content(), result.isError());
+        }
+        return end;
+    }
+
+    /**
+     * 串行执行单个工具调用。
+     */
+    private void executeSingleCall(List<ToolCall> calls, List<ToolResult> results, ToolDisplay display, Mode mode,
+            int index) {
+        ToolCall call = calls.get(index);
+        String args = previewArgs(call);
+        ToolResult result = evaluateSingleCall(call, args, mode, display);
+        display.onToolEnd(call.name(), args, result.content(), result.isError());
+        results.set(index, result);
+    }
+
+    /**
+     * 对单个有副作用工具做权限判定与执行。
+     */
+    private ToolResult evaluateSingleCall(ToolCall call, String args, Mode mode, ToolDisplay display) {
+        PermissionEngine.CheckResult check = permissionEngine.check(mode, call, false);
+        if (check.decision() == Decision.DENY) {
+            return new ToolResult(call.id(), check.reason(), true);
+        }
+        if (check.decision() == Decision.ASK) {
+            Outcome outcome = approvalHandler.requestApproval(call, args, check.reason());
+            if (outcome == Outcome.DENY_ONCE) {
+                return new ToolResult(call.id(), check.reason(), true);
+            }
+            if (outcome == Outcome.ALLOW_FOREVER) {
+                try {
+                    permissionEngine.persistLocalAllow(call);
+                } catch (Exception e) {
+                    debug("persist local allow failed: " + e.getMessage());
+                }
+            }
+        }
+        display.onToolStart(call.name(), args);
+        Result result = runToolCall(call, mode, new AtomicBoolean(false));
+        return new ToolResult(call.id(), result.content(), result.isError());
+    }
+
+    private int countRunnableReads(List<ToolResult> results, int start, int end) {
+        int count = 0;
+        for (int i = start; i < end; i++) {
+            if (results.get(i) == null) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * 按当前模式执行单个工具调用。
+     */
+    private Result runToolCall(ToolCall call, Mode mode, AtomicBoolean cancelled) {
+        if (mode == Mode.PLAN && !registry.isReadOnly(call.name())) {
+            return Result.error("计划模式下禁止执行非只读工具: " + call.name());
+        }
+        return executeWithTimeout(call, cancelled);
+    }
+
+    /**
      * 为单次工具调用施加超时保护，防止卡住整个代理循环。
      */
-    private Result executeWithTimeout(final ToolCall call) {
+    private Result executeWithTimeout(final ToolCall call, AtomicBoolean cancelled) {
         ExecutorService executor = Executors.newSingleThreadExecutor();
-        final ToolContext context = ToolContext.fresh();
+        final ToolContext context = new ToolContext(cancelled);
         Future<Result> future = executor.submit(new Callable<Result>() {
             @Override
             public Result call() {
@@ -287,8 +343,8 @@ public final class ToolAgent {
         try {
             JsonNode root = JSON.readTree(call.inputJson());
             String[] keys = { "path", "command", "pattern", "old_string" };
-            for (String key : keys) {
-                JsonNode value = root.get(key);
+            for (int i = 0; i < keys.length; i++) {
+                JsonNode value = root.get(keys[i]);
                 if (value != null && value.isTextual()) {
                     return truncate(value.asText(), 80);
                 }
@@ -307,60 +363,6 @@ public final class ToolAgent {
             return "";
         }
         return value.length() <= max ? value : value.substring(0, max - 3) + "...";
-    }
-
-    /**
-     * 生成计划模式下用于检测重复探测的签名。
-     */
-    private String buildPlanSignature(List<ToolCall> calls, List<ToolResult> results) {
-        StringBuilder signature = new StringBuilder();
-        for (int i = 0; i < calls.size(); i++) {
-            ToolCall call = calls.get(i);
-            signature.append(call.name()).append('|').append(call.inputJson()).append('|');
-            if (i < results.size()) {
-                ToolResult result = results.get(i);
-                signature.append(result.isError()).append('|').append(result.content());
-            }
-            signature.append('\n');
-        }
-        return signature.toString();
-    }
-
-    /**
-     * 判断本轮只读探测是否整体指向“工作区为空”这个结论。
-     */
-    private boolean looksLikeEmptyWorkspace(List<ToolCall> calls, List<ToolResult> results) {
-        if (calls.isEmpty() || calls.size() != results.size()) {
-            return false;
-        }
-        for (int i = 0; i < calls.size(); i++) {
-            ToolCall call = calls.get(i);
-            ToolResult result = results.get(i);
-            if (!registry.isReadOnly(call.name())) {
-                return false;
-            }
-            if (!isEmptyWorkspaceSignal(call.name(), result)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * 根据工具结果文本识别常见的空工作区信号。
-     */
-    private boolean isEmptyWorkspaceSignal(String toolName, ToolResult result) {
-        String content = result.content() == null ? "" : result.content();
-        if ("glob".equals(toolName)) {
-            return !result.isError() && content.contains("无匹配");
-        }
-        if ("grep".equals(toolName)) {
-            return !result.isError() && content.contains("无命中");
-        }
-        if ("read_file".equals(toolName)) {
-            return result.isError() && content.contains("文件不存在");
-        }
-        return false;
     }
 
     /**

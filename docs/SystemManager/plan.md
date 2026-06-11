@@ -4,7 +4,7 @@
 
 ## 架构概览
 
-ch05 在三层叠加,**不改 AgentLoop 的 Agent Loop 控制流**:
+SystemManager 在三层叠加,**不改 AgentLoop 的 Agent Loop 控制流**:
 
 - **prompt 包(重写)**:从「单个常量字符串」升级为「模块化装配 + 环境采集 + 补充消息构造」。对外产出三类文本——**稳定系统提示**(可缓存)、**环境信息段**(不缓存)、**system-reminder 包裹的补充指令**。prompt 包不依赖 llm 包(避免环依赖)。
 - **llm 包(改造)**:`Provider.stream` 入参从位置参数改为 `Request` record,承载 `messages / tools / system{stable,environment} / reminder`。Anthropic 把 stable 块打缓存断点、env 块不打;OpenAI 把 stable 置于系统消息前缀。`Usage` 增加缓存写/读字段。两 provider 把 `reminder` 按各自协议安全地织入消息通道(N3)。

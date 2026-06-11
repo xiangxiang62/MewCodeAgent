@@ -6,6 +6,7 @@ import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.LlmProviderFactory;
 import dev.mewcode.agent.llm.Role;
+import dev.mewcode.agent.permission.PermissionEngine;
 import dev.mewcode.agent.prompt.Prompt;
 import dev.mewcode.agent.tool.Registry;
 import dev.mewcode.agent.ui.ChatConsole;
@@ -48,8 +49,9 @@ public final class MewCodeApp {
         messages.add(new ChatMessage(Role.SYSTEM, Prompt.buildSystemPrompt()));
         messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
         Registry registry = Registry.defaultRegistry();
+        PermissionEngine permissionEngine = PermissionEngine.create(Paths.get("").toAbsolutePath());
 
-        ChatConsole console = new ChatConsole("MewCode", configPath, config.llm());
+        ChatConsole console = new ChatConsole("MewCode", configPath, config.llm(), permissionEngine);
         console.run(messages, provider, registry);
     }
 

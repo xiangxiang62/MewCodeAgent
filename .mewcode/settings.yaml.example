@@ -1,0 +1,9 @@
+defaultMode: default
+permissions:
+  allow:
+    - "Bash(git *)"
+    - "Bash(mvn test)"
+  deny:
+    - "Bash(rm *)"
+    - "Read(.env)"
+    - "Write(.env)"
