@@ -8,6 +8,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * 执行单条 shell 命令，并返回合并后的标准输出。
+ */
 public final class BashTool implements Tool {
     @Override
     public String name() {
@@ -18,6 +21,8 @@ public final class BashTool implements Tool {
     public String description() {
         return "Use this tool to run one shell command in the current workspace. Choose it for build, test, list, "
                 + "inspect, or other terminal tasks such as 'run mvn test', 'execute dir', or 'type a file'. "
+                + "Prefer dedicated tools such as read_file, glob, and grep for reading files or searching content "
+                + "instead of using bash for that. "
                 + "Required parameter: command. Returns combined output and exit code.";
     }
 
@@ -32,6 +37,9 @@ public final class BashTool implements Tool {
         return false;
     }
 
+    /**
+     * 执行命令并在超时或取消时安全返回错误结果。
+     */
     @Override
     public Result execute(ToolContext context, String inputJson) {
         try {
@@ -71,6 +79,9 @@ public final class BashTool implements Tool {
         }
     }
 
+    /**
+     * 持续读取子进程输出，避免输出缓冲阻塞命令执行。
+     */
     private void copy(InputStream input, ByteArrayOutputStream output) {
         try {
             byte[] buffer = new byte[4096];
@@ -79,7 +90,7 @@ public final class BashTool implements Tool {
                 output.write(buffer, 0, read);
             }
         } catch (Exception ignored) {
-            // The reader thread exits naturally when the process ends or is destroyed.
+            // 进程结束或被销毁后，读取线程会自然退出。
         }
     }
 }

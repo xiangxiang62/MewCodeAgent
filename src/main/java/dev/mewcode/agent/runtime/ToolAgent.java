@@ -5,12 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.ChatResponse;
 import dev.mewcode.agent.llm.LlmProvider;
+import dev.mewcode.agent.llm.LlmRequest;
 import dev.mewcode.agent.llm.Role;
 import dev.mewcode.agent.llm.StreamCallback;
 import dev.mewcode.agent.llm.ToolCall;
 import dev.mewcode.agent.llm.ToolDefinition;
 import dev.mewcode.agent.llm.ToolResult;
+import dev.mewcode.agent.prompt.EnvironmentInfo;
 import dev.mewcode.agent.prompt.Prompt;
+import dev.mewcode.agent.prompt.Reminder;
 import dev.mewcode.agent.tool.Registry;
 import dev.mewcode.agent.tool.Result;
 import dev.mewcode.agent.tool.ToolContext;
@@ -24,7 +27,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * 串联模型、工具和会话历史的主执行器。
+ */
 public final class ToolAgent {
+    /**
+     * 代理当前所处的执行模式。
+     */
     public enum Mode {
         NORMAL,
         PLAN
@@ -36,29 +45,45 @@ public final class ToolAgent {
     private static final int MAX_ITERATIONS = 12;
     private static final int MAX_UNKNOWN_ROUNDS = 3;
     private static final int MAX_REPEATED_PLAN_ROUNDS = 2;
+    private static final int PLAN_REMINDER_INTERVAL = 4;
 
     private final LlmProvider provider;
     private final Registry registry;
 
+    /**
+     * 创建一个代理实例。
+     */
     public ToolAgent(LlmProvider provider, Registry registry) {
         this.provider = provider;
         this.registry = registry;
     }
 
+    /**
+     * 以普通模式运行一轮代理流程。
+     */
     public String run(List<ChatMessage> messages, StreamCallback callback, ToolDisplay display) throws Exception {
         return run(messages, callback, display, Mode.NORMAL);
     }
 
-    public String run(List<ChatMessage> messages, StreamCallback callback, ToolDisplay display, Mode mode) throws Exception {
+    /**
+     * 按指定模式执行多轮“模型决策 -> 工具调用 -> 结果回灌”循环。
+     */
+    public String run(List<ChatMessage> messages, StreamCallback callback, ToolDisplay display, Mode mode)
+            throws Exception {
         int unknownRounds = 0;
         String previousPlanSignature = null;
         int repeatedPlanRounds = 0;
         boolean emptyWorkspaceDetected = hasEmptyWorkspaceMarker(messages);
+        String systemPrompt = Prompt.buildSystemPrompt();
+        String environmentInfo = EnvironmentInfo.gather("0.1.0-SNAPSHOT", provider.model()).render();
 
         for (int iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
             debug("starting iteration " + iteration + " in mode " + mode);
             List<ToolDefinition> definitions = selectDefinitions(mode, emptyWorkspaceDetected);
-            ChatResponse response = provider.streamChat(buildRequestMessages(messages, mode, emptyWorkspaceDetected), definitions, callback);
+            String reminder = buildReminder(mode, emptyWorkspaceDetected, iteration);
+            ChatResponse response = provider.streamChat(
+                    new LlmRequest(buildRequestMessages(messages), definitions, systemPrompt, environmentInfo, reminder),
+                    callback);
             List<ToolCall> toolCalls = response.toolCalls();
             debug("iteration " + iteration + " tool call count = " + toolCalls.size());
 
@@ -68,7 +93,8 @@ public final class ToolAgent {
                 return finalText;
             }
 
-            messages.add(new ChatMessage(Role.ASSISTANT, response.text(), toolCalls, Collections.<ToolResult>emptyList()));
+            messages.add(new ChatMessage(Role.ASSISTANT, response.text(), toolCalls,
+                    Collections.<ToolResult>emptyList()));
             List<ToolResult> results = executeCalls(toolCalls, display, mode);
             messages.add(new ChatMessage(Role.TOOL, "", Collections.<ToolCall>emptyList(), results));
 
@@ -112,17 +138,48 @@ public final class ToolAgent {
         return capped;
     }
 
-    private List<ChatMessage> buildRequestMessages(List<ChatMessage> messages, Mode mode, boolean emptyWorkspaceDetected) {
-        List<ChatMessage> requestMessages = new ArrayList<ChatMessage>(messages);
-        if (mode == Mode.PLAN) {
-            requestMessages.add(new ChatMessage(Role.SYSTEM, Prompt.PLAN_MODE_REMINDER));
-            if (emptyWorkspaceDetected) {
-                requestMessages.add(new ChatMessage(Role.SYSTEM, Prompt.EMPTY_WORKSPACE_REMINDER));
-            }
-        }
-        return requestMessages;
+    /**
+     * 为本轮请求复制一份消息快照，避免外部列表在请求途中继续变化。
+     */
+    private List<ChatMessage> buildRequestMessages(List<ChatMessage> messages) {
+        return new ArrayList<ChatMessage>(messages);
     }
 
+    /**
+     * 生成本轮 reminder；计划模式和空工作区提示会在这里合并。
+     */
+    private String buildReminder(Mode mode, boolean emptyWorkspaceDetected, int iteration) {
+        List<String> parts = new ArrayList<String>();
+        if (mode == Mode.PLAN) {
+            boolean full = iteration == 1 || ((iteration - 1) % PLAN_REMINDER_INTERVAL == 0);
+            parts.add(Reminder.plan(full));
+        }
+        if (emptyWorkspaceDetected) {
+            parts.add(Reminder.systemReminder(Prompt.EMPTY_WORKSPACE_REMINDER));
+        }
+        return joinNonEmpty(parts);
+    }
+
+    /**
+     * 用空行拼接非空文本段。
+     */
+    private String joinNonEmpty(List<String> parts) {
+        StringBuilder builder = new StringBuilder();
+        for (String part : parts) {
+            if (part == null || part.trim().isEmpty()) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append("\n\n");
+            }
+            builder.append(part.trim());
+        }
+        return builder.toString();
+    }
+
+    /**
+     * 根据模式选择当前轮允许模型调用的工具集合。
+     */
     private List<ToolDefinition> selectDefinitions(Mode mode, boolean emptyWorkspaceDetected) {
         if (mode == Mode.PLAN) {
             if (emptyWorkspaceDetected) {
@@ -133,6 +190,9 @@ public final class ToolAgent {
         return registry.definitions();
     }
 
+    /**
+     * 检查会话历史里是否已经记录过空工作区标记。
+     */
     private boolean hasEmptyWorkspaceMarker(List<ChatMessage> messages) {
         for (ChatMessage message : messages) {
             if (message.role() == Role.SYSTEM && Prompt.EMPTY_WORKSPACE_MARKER.equals(message.content())) {
@@ -142,12 +202,18 @@ public final class ToolAgent {
         return false;
     }
 
+    /**
+     * 向会话历史补充空工作区标记，避免后续重复探测。
+     */
     private void addEmptyWorkspaceMarker(List<ChatMessage> messages) {
         if (!hasEmptyWorkspaceMarker(messages)) {
             messages.add(new ChatMessage(Role.SYSTEM, Prompt.EMPTY_WORKSPACE_MARKER));
         }
     }
 
+    /**
+     * 兜底补齐模型没有输出文本时的可见回复。
+     */
     private String ensureAssistantText(String text, Mode mode) {
         if (text != null && !text.trim().isEmpty()) {
             return text;
@@ -158,6 +224,9 @@ public final class ToolAgent {
         return "本轮已完成执行，但模型没有输出最终文本。";
     }
 
+    /**
+     * 判断本轮工具调用是否全部未注册。
+     */
     private boolean allUnknown(List<ToolCall> calls) {
         for (ToolCall call : calls) {
             if (registry.get(call.name()).isPresent()) {
@@ -167,6 +236,9 @@ public final class ToolAgent {
         return true;
     }
 
+    /**
+     * 顺序执行本轮工具调用，并把结果转换成模型可消费的结构。
+     */
     private List<ToolResult> executeCalls(List<ToolCall> calls, ToolDisplay display, Mode mode) {
         List<ToolResult> results = new ArrayList<ToolResult>();
         for (ToolCall call : calls) {
@@ -185,6 +257,9 @@ public final class ToolAgent {
         return results;
     }
 
+    /**
+     * 为单次工具调用施加超时保护，防止卡住整个代理循环。
+     */
     private Result executeWithTimeout(final ToolCall call) {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         final ToolContext context = ToolContext.fresh();
@@ -205,10 +280,13 @@ public final class ToolAgent {
         }
     }
 
+    /**
+     * 从工具参数中挑选一个适合展示的关键字段，减少终端噪声。
+     */
     private String previewArgs(ToolCall call) {
         try {
             JsonNode root = JSON.readTree(call.inputJson());
-            String[] keys = {"path", "command", "pattern", "old_string"};
+            String[] keys = { "path", "command", "pattern", "old_string" };
             for (String key : keys) {
                 JsonNode value = root.get(key);
                 if (value != null && value.isTextual()) {
@@ -216,11 +294,14 @@ public final class ToolAgent {
                 }
             }
         } catch (Exception ignored) {
-            // Invalid JSON will be surfaced by the tool execution result.
+            // 非法 JSON 会在工具执行结果中体现，这里只负责尽量展示摘要。
         }
         return truncate(call.inputJson(), 80);
     }
 
+    /**
+     * 截断较长参数字符串，避免终端输出过长。
+     */
     private String truncate(String value, int max) {
         if (value == null) {
             return "";
@@ -228,6 +309,9 @@ public final class ToolAgent {
         return value.length() <= max ? value : value.substring(0, max - 3) + "...";
     }
 
+    /**
+     * 生成计划模式下用于检测重复探测的签名。
+     */
     private String buildPlanSignature(List<ToolCall> calls, List<ToolResult> results) {
         StringBuilder signature = new StringBuilder();
         for (int i = 0; i < calls.size(); i++) {
@@ -242,6 +326,9 @@ public final class ToolAgent {
         return signature.toString();
     }
 
+    /**
+     * 判断本轮只读探测是否整体指向“工作区为空”这个结论。
+     */
     private boolean looksLikeEmptyWorkspace(List<ToolCall> calls, List<ToolResult> results) {
         if (calls.isEmpty() || calls.size() != results.size()) {
             return false;
@@ -259,6 +346,9 @@ public final class ToolAgent {
         return true;
     }
 
+    /**
+     * 根据工具结果文本识别常见的空工作区信号。
+     */
     private boolean isEmptyWorkspaceSignal(String toolName, ToolResult result) {
         String content = result.content() == null ? "" : result.content();
         if ("glob".equals(toolName)) {
@@ -273,6 +363,9 @@ public final class ToolAgent {
         return false;
     }
 
+    /**
+     * 在调试开关开启时输出内部日志。
+     */
     private void debug(String message) {
         if (DEBUG_TOOL_CALLS) {
             System.err.println("[MewCode][ToolAgent] " + message);

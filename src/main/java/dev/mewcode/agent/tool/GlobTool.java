@@ -13,6 +13,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
+/**
+ * 按 glob 模式查找文件名。
+ */
 public final class GlobTool implements Tool {
     @Override
     public String name() {
@@ -38,6 +41,9 @@ public final class GlobTool implements Tool {
         return true;
     }
 
+    /**
+     * 遍历指定目录树，并返回命中 glob 模式的文件列表。
+     */
     @Override
     public Result execute(ToolContext context, String inputJson) {
         try {
@@ -45,7 +51,7 @@ public final class GlobTool implements Tool {
             String pattern = JsonArgs.requiredText(args, "pattern").replace('\\', '/');
             Path root = Paths.get(JsonArgs.optionalText(args, "path", "."));
             PathMatcher matcher = FileSystems.getDefault().getPathMatcher("glob:" + pattern);
-            List<String> matches = new ArrayList<>();
+            List<String> matches = new ArrayList<String>();
             try (Stream<Path> stream = Files.walk(root)) {
                 stream.filter(Files::isRegularFile).forEach(path -> {
                     if (context.cancelled().get() || matches.size() >= 100) {

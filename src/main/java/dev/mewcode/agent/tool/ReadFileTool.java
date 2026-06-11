@@ -7,6 +7,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
 
+/**
+ * 读取单个本地文本文件，并返回带行号的内容。
+ */
 public final class ReadFileTool implements Tool {
     @Override
     public String name() {
@@ -32,6 +35,9 @@ public final class ReadFileTool implements Tool {
         return true;
     }
 
+    /**
+     * 读取目标文件并为每一行补上行号，方便模型后续引用和编辑。
+     */
     @Override
     public Result execute(ToolContext context, String inputJson) {
         try {

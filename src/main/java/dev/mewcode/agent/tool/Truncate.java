@@ -2,10 +2,16 @@ package dev.mewcode.agent.tool;
 
 import java.nio.charset.StandardCharsets;
 
+/**
+ * 控制文本返回大小，避免工具结果过长压爆上下文。
+ */
 public final class Truncate {
     private Truncate() {
     }
 
+    /**
+     * 同时按行数和 UTF-8 字节数截断文本。
+     */
     public static String byLinesAndBytes(String text, int maxLines, int maxBytes) {
         String value = text == null ? "" : text;
         StringBuilder out = new StringBuilder();

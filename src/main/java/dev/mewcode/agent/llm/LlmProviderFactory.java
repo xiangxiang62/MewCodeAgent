@@ -6,12 +6,15 @@ import dev.mewcode.agent.llm.openai.OpenAiProvider;
 
 import java.util.Locale;
 
+/**
+ * 根据配置构造具体的模型提供方实现。
+ */
 public final class LlmProviderFactory {
     private LlmProviderFactory() {
     }
 
     /**
-     * 根据配置中的 protocol 创建对应的 LLM Provider。
+     * 按 `protocol` 选择并创建对应 Provider。
      */
     public static LlmProvider create(LlmConfig config) {
         switch (config.protocol().toLowerCase(Locale.ROOT)) {

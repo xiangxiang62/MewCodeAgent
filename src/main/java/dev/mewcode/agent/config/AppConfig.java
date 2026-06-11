@@ -2,6 +2,9 @@ package dev.mewcode.agent.config;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 
+/**
+ * 应用顶层配置对象。
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public final class AppConfig {
     private LlmConfig llm;
@@ -14,7 +17,7 @@ public final class AppConfig {
     }
 
     /**
-     * Jackson 反序列化 YAML 时注入 LLM 配置。
+     * 供 Jackson 反序列化时注入 LLM 配置。
      */
     public void setLlm(LlmConfig llm) {
         this.llm = llm;

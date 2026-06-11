@@ -4,12 +4,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.charset.StandardCharsets;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * 负责读取 YAML 配置并做启动前校验。
+ */
 public final class ConfigLoader {
     private static final ObjectMapper YAML = new ObjectMapper(new YAMLFactory());
     private static final Pattern ENV_PATTERN = Pattern.compile("\\$\\{([A-Za-z_][A-Za-z0-9_]*)}");
@@ -32,7 +35,7 @@ public final class ConfigLoader {
     }
 
     /**
-     * 将配置中的 ${ENV_NAME} 替换为同名环境变量值；未设置时保留原占位符，方便报错定位。
+     * 将配置中的 `${ENV_NAME}` 替换为同名环境变量值；未设置时保留占位符。
      */
     private static String expandEnvironmentVariables(String yaml) {
         Matcher matcher = ENV_PATTERN.matcher(yaml);
@@ -65,7 +68,7 @@ public final class ConfigLoader {
     }
 
     /**
-     * 校验单个字符串字段是否存在且非空。
+     * 校验单个字符串字段存在且非空。
      */
     private static void require(String name, String value) {
         if (value == null || value.trim().isEmpty()) {

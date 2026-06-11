@@ -1,7 +1,8 @@
 package dev.mewcode.agent.llm;
 
-import java.util.List;
-
+/**
+ * 抽象不同模型协议下的统一调用接口。
+ */
 public interface LlmProvider {
     /**
      * 返回 Provider 名称，用于启动信息和调试输出。
@@ -9,9 +10,14 @@ public interface LlmProvider {
     String name();
 
     /**
-     * 根据完整对话历史发起流式聊天请求。
-     *
-     * @return 本轮完整助手回复，用于追加到会话历史中。
+     * 返回当前使用的模型名。
      */
-    ChatResponse streamChat(List<ChatMessage> messages, List<ToolDefinition> tools, StreamCallback callback) throws Exception;
+    String model();
+
+    /**
+     * 根据完整会话上下文发起流式请求。
+     *
+     * @return 本轮聚合后的完整响应
+     */
+    ChatResponse streamChat(LlmRequest request, StreamCallback callback) throws Exception;
 }

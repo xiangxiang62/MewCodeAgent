@@ -16,6 +16,9 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 import java.util.stream.Stream;
 
+/**
+ * 在文件内容中按文本或正则查找匹配项。
+ */
 public final class GrepTool implements Tool {
     @Override
     public String name() {
@@ -42,6 +45,9 @@ public final class GrepTool implements Tool {
         return true;
     }
 
+    /**
+     * 搜索工作区内匹配内容，并返回“文件:行号:文本”格式的结果。
+     */
     @Override
     public Result execute(ToolContext context, String inputJson) {
         try {
@@ -55,7 +61,7 @@ public final class GrepTool implements Tool {
             Path root = Paths.get(JsonArgs.optionalText(args, "path", "."));
             String glob = JsonArgs.optionalText(args, "glob", null);
             PathMatcher matcher = glob == null ? null : FileSystems.getDefault().getPathMatcher("glob:" + glob);
-            List<String> hits = new ArrayList<>();
+            List<String> hits = new ArrayList<String>();
             try (Stream<Path> stream = Files.walk(root)) {
                 stream.filter(Files::isRegularFile).forEach(path -> {
                     if (context.cancelled().get() || hits.size() >= 100) {
@@ -81,6 +87,9 @@ public final class GrepTool implements Tool {
         }
     }
 
+    /**
+     * 逐行扫描单个文件，并把命中的行追加到结果列表。
+     */
     private void searchFile(Pattern pattern, Path path, List<String> hits) {
         try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
             String line;
@@ -95,7 +104,7 @@ public final class GrepTool implements Tool {
                 }
             }
         } catch (Exception ignored) {
-            // Skip unreadable or non-UTF-8 files so one file does not stop the whole search.
+            // 跳过不可读或非 UTF-8 文件，避免单个文件中断整个搜索。
         }
     }
 }

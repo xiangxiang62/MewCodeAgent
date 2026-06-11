@@ -1,5 +1,8 @@
 package dev.mewcode.agent.llm;
 
+/**
+ * 会话消息角色。
+ */
 public enum Role {
     SYSTEM("system"),
     USER("user"),
@@ -13,7 +16,7 @@ public enum Role {
     }
 
     /**
-     * 返回发送给 LLM API 时使用的角色名称。
+     * 返回发送给模型协议时使用的角色名。
      */
     public String wireName() {
         return wireName;

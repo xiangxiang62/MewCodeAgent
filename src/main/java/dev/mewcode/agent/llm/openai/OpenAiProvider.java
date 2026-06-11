@@ -6,15 +6,17 @@ import dev.mewcode.agent.config.LlmConfig;
 import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.ChatResponse;
 import dev.mewcode.agent.llm.LlmProvider;
+import dev.mewcode.agent.llm.LlmRequest;
 import dev.mewcode.agent.llm.StreamCallback;
 import dev.mewcode.agent.llm.ToolCall;
 import dev.mewcode.agent.llm.ToolDefinition;
 import dev.mewcode.agent.llm.ToolResult;
+import dev.mewcode.agent.llm.Usage;
 import dev.mewcode.agent.llm.http.SseClient;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
@@ -24,6 +26,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * OpenAI Chat Completions 协议适配器。
+ */
 public final class OpenAiProvider implements LlmProvider {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final boolean DEBUG_TOOL_CALLS = Boolean.parseBoolean(
@@ -31,12 +36,15 @@ public final class OpenAiProvider implements LlmProvider {
 
     private final LlmConfig config;
 
+    /**
+     * 创建 OpenAI Provider。
+     */
     public OpenAiProvider(LlmConfig config) {
         this.config = config;
     }
 
     /**
-     * 返回当前 Provider 的展示名称。
+     * 返回 Provider 显示名。
      */
     @Override
     public String name() {
@@ -44,32 +52,54 @@ public final class OpenAiProvider implements LlmProvider {
     }
 
     /**
-     * 调用 OpenAI Chat Completions 流式接口，并把文本增量回调给终端层。
+     * 返回当前模型名。
      */
     @Override
-    public ChatResponse streamChat(List<ChatMessage> messages, List<ToolDefinition> tools, StreamCallback callback) throws Exception {
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("model", config.model());
-        payload.put("max_tokens", config.effectiveMaxTokens());
-        payload.put("stream", true);
-        payload.put("messages", toWireMessages(messages));
-        if (tools != null && !tools.isEmpty()) {
-            payload.put("tools", toWireTools(tools));
-            payload.put("tool_choice", "auto");
-            payload.put("parallel_tool_calls", false);
-        }
+    public String model() {
+        return config.model();
+    }
+
+    /**
+     * 发起 OpenAI 流式请求，并在解析增量时同步向 UI 推送文本。
+     */
+    @Override
+    public ChatResponse streamChat(LlmRequest request, StreamCallback callback) throws Exception {
+        Map<String, Object> payload = buildPayload(request);
         debug("OpenAI request payload: " + redactSecrets(JSON.writeValueAsString(payload)));
 
         HttpURLConnection connection = openConnection(endpoint(), JSON.writeValueAsString(payload));
         ensureSuccess(connection);
         StringBuilder fullText = new StringBuilder();
-        Map<Integer, ToolCallBuilder> toolCalls = new LinkedHashMap<>();
-        SseClient.consume(connection.getInputStream(), data -> handleData(data, callback, fullText, toolCalls));
-        return new ChatResponse(fullText.toString(), buildToolCalls(toolCalls));
+        Map<Integer, ToolCallBuilder> toolCalls = new LinkedHashMap<Integer, ToolCallBuilder>();
+        UsageHolder usageHolder = new UsageHolder();
+        SseClient.consume(connection.getInputStream(),
+                data -> handleData(data, callback, fullText, toolCalls, usageHolder));
+        return new ChatResponse(fullText.toString(), buildToolCalls(toolCalls), usageHolder.toUsage());
     }
 
     /**
-     * 创建并写入 OpenAI HTTP 请求。这里保持 InputStream 流式读取，避免提前缓存完整响应。
+     * 组装 OpenAI 协议请求体。
+     */
+    Map<String, Object> buildPayload(LlmRequest request) {
+        Map<String, Object> payload = new LinkedHashMap<String, Object>();
+        payload.put("model", config.model());
+        payload.put("max_tokens", config.effectiveMaxTokens());
+        payload.put("stream", true);
+        payload.put("messages", toWireMessages(
+                request.messages(),
+                request.systemPrompt(),
+                request.environmentInfo(),
+                request.reminder()));
+        if (request.tools() != null && !request.tools().isEmpty()) {
+            payload.put("tools", toWireTools(request.tools()));
+            payload.put("tool_choice", "auto");
+            payload.put("parallel_tool_calls", false);
+        }
+        return payload;
+    }
+
+    /**
+     * 创建 HTTP 连接并写入 JSON 请求体。
      */
     private HttpURLConnection openConnection(URI endpoint, String body) throws IOException {
         HttpURLConnection connection = (HttpURLConnection) endpoint.toURL().openConnection();
@@ -89,7 +119,7 @@ public final class OpenAiProvider implements LlmProvider {
     }
 
     /**
-     * 检查 HTTP 状态码，失败时带上请求 ID 便于排查服务端问题。
+     * 校验 HTTP 返回码，失败时尽量带上 request id 和错误体。
      */
     private void ensureSuccess(HttpURLConnection connection) throws IOException {
         int statusCode = connection.getResponseCode();
@@ -101,14 +131,14 @@ public final class OpenAiProvider implements LlmProvider {
     }
 
     /**
-     * 将空值统一展示为 unknown。
+     * 将空值统一显示为 `unknown`。
      */
     private String valueOrUnknown(String value) {
         return value == null || value.trim().isEmpty() ? "unknown" : value;
     }
 
     /**
-     * 生成 Chat Completions endpoint，兼容 base_url 和完整 endpoint 两种配置。
+     * 兼容 `base_url` 既可能是根路径，也可能已经指向完整 endpoint 的情况。
      */
     private URI endpoint() {
         String base = config.baseUrl().replaceAll("/+$", "");
@@ -119,21 +149,35 @@ public final class OpenAiProvider implements LlmProvider {
     }
 
     /**
-     * 将内部消息结构转换为 OpenAI API 接收的 messages 数组。
+     * 将内部消息结构转换成 OpenAI `messages` 数组。
      */
-    private List<Map<String, Object>> toWireMessages(List<ChatMessage> messages) {
-        List<Map<String, Object>> wire = new ArrayList<>();
+    private List<Map<String, Object>> toWireMessages(
+            List<ChatMessage> messages,
+            String systemPrompt,
+            String environmentInfo,
+            String reminder) {
+        List<Map<String, Object>> wire = new ArrayList<Map<String, Object>>();
+        String systemContent = joinSections(systemPrompt, environmentInfo);
+        if (!systemContent.isEmpty()) {
+            Map<String, Object> systemMessage = new LinkedHashMap<String, Object>();
+            systemMessage.put("role", "system");
+            systemMessage.put("content", systemContent);
+            wire.add(systemMessage);
+        }
         for (ChatMessage message : messages) {
+            if (message.role() == dev.mewcode.agent.llm.Role.SYSTEM) {
+                continue;
+            }
             if (message.role() == dev.mewcode.agent.llm.Role.TOOL) {
                 for (ToolResult result : message.toolResults()) {
-                    Map<String, Object> item = new LinkedHashMap<>();
+                    Map<String, Object> item = new LinkedHashMap<String, Object>();
                     item.put("role", "tool");
                     item.put("tool_call_id", result.toolCallId());
                     item.put("content", result.content());
                     wire.add(item);
                 }
             } else {
-                Map<String, Object> item = new LinkedHashMap<>();
+                Map<String, Object> item = new LinkedHashMap<String, Object>();
                 item.put("role", message.role().wireName());
                 item.put("content", message.content());
                 if (!message.toolCalls().isEmpty()) {
@@ -142,17 +186,49 @@ public final class OpenAiProvider implements LlmProvider {
                 wire.add(item);
             }
         }
+        if (reminder != null && !reminder.trim().isEmpty()) {
+            Map<String, Object> reminderMessage = new LinkedHashMap<String, Object>();
+            reminderMessage.put("role", "user");
+            reminderMessage.put("content", reminder);
+            wire.add(reminderMessage);
+        }
         return wire;
     }
 
+    /**
+     * 将稳定系统提示和环境信息拼成单个 system message。
+     */
+    private String joinSections(String systemPrompt, String environmentInfo) {
+        StringBuilder builder = new StringBuilder();
+        appendSection(builder, systemPrompt);
+        appendSection(builder, environmentInfo);
+        return builder.toString();
+    }
+
+    /**
+     * 仅在值非空时追加文本段。
+     */
+    private void appendSection(StringBuilder builder, String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return;
+        }
+        if (builder.length() > 0) {
+            builder.append("\n\n");
+        }
+        builder.append(value.trim());
+    }
+
+    /**
+     * 将工具定义转换为 OpenAI `tools` 格式。
+     */
     private List<Map<String, Object>> toWireTools(List<ToolDefinition> tools) {
-        List<Map<String, Object>> wire = new ArrayList<>();
+        List<Map<String, Object>> wire = new ArrayList<Map<String, Object>>();
         for (ToolDefinition tool : tools) {
-            Map<String, Object> function = new LinkedHashMap<>();
+            Map<String, Object> function = new LinkedHashMap<String, Object>();
             function.put("name", tool.name());
             function.put("description", tool.description());
             function.put("parameters", tool.inputSchema());
-            Map<String, Object> item = new LinkedHashMap<>();
+            Map<String, Object> item = new LinkedHashMap<String, Object>();
             item.put("type", "function");
             item.put("function", function);
             wire.add(item);
@@ -160,13 +236,16 @@ public final class OpenAiProvider implements LlmProvider {
         return wire;
     }
 
+    /**
+     * 将内部工具调用结构转换为 OpenAI assistant message 中的 `tool_calls`。
+     */
     private List<Map<String, Object>> toOpenAiToolCalls(List<ToolCall> calls) {
-        List<Map<String, Object>> wire = new ArrayList<>();
+        List<Map<String, Object>> wire = new ArrayList<Map<String, Object>>();
         for (ToolCall call : calls) {
-            Map<String, Object> function = new LinkedHashMap<>();
+            Map<String, Object> function = new LinkedHashMap<String, Object>();
             function.put("name", call.name());
             function.put("arguments", call.inputJson());
-            Map<String, Object> item = new LinkedHashMap<>();
+            Map<String, Object> item = new LinkedHashMap<String, Object>();
             item.put("id", call.id());
             item.put("type", "function");
             item.put("function", function);
@@ -176,10 +255,14 @@ public final class OpenAiProvider implements LlmProvider {
     }
 
     /**
-     * 解析 OpenAI SSE data，提取 choices[0].delta.content 文本增量。
+     * 解析 OpenAI SSE 增量，累计文本、工具调用和用量信息。
      */
-    private void handleData(String data, StreamCallback callback, StringBuilder fullText,
-                            Map<Integer, ToolCallBuilder> toolCalls) {
+    private void handleData(
+            String data,
+            StreamCallback callback,
+            StringBuilder fullText,
+            Map<Integer, ToolCallBuilder> toolCalls,
+            UsageHolder usageHolder) {
         if ("[DONE]".equals(data)) {
             return;
         }
@@ -191,6 +274,7 @@ public final class OpenAiProvider implements LlmProvider {
             if (!error.isMissingNode() && !error.isNull()) {
                 throw new IllegalStateException(formatStreamError(error));
             }
+            usageHolder.capture(root.path("usage"));
             JsonNode content = root.at("/choices/0/delta/content");
             if (content.isTextual()) {
                 String text = content.asText();
@@ -225,18 +309,27 @@ public final class OpenAiProvider implements LlmProvider {
         }
     }
 
+    /**
+     * 在调试开关开启时输出内部日志。
+     */
     private void debug(String message) {
         if (DEBUG_TOOL_CALLS) {
             System.err.println("[MewCode][OpenAI] " + message);
         }
     }
 
+    /**
+     * 避免调试日志中泄露真实 API Key。
+     */
     private String redactSecrets(String json) {
         return json.replace(config.apiKey(), "***");
     }
 
+    /**
+     * 把增量累积器转换成最终工具调用列表。
+     */
     private List<ToolCall> buildToolCalls(Map<Integer, ToolCallBuilder> builders) {
-        List<ToolCall> calls = new ArrayList<>();
+        List<ToolCall> calls = new ArrayList<ToolCall>();
         for (Map.Entry<Integer, ToolCallBuilder> entry : builders.entrySet()) {
             ToolCallBuilder builder = entry.getValue();
             if (builder.name != null && !builder.name.isEmpty()) {
@@ -247,6 +340,9 @@ public final class OpenAiProvider implements LlmProvider {
         return calls;
     }
 
+    /**
+     * 读取失败响应体，便于上层定位问题。
+     */
     private String readErrorBody(HttpURLConnection connection) throws IOException {
         InputStream errorStream = connection.getErrorStream();
         if (errorStream == null) {
@@ -259,15 +355,21 @@ public final class OpenAiProvider implements LlmProvider {
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
+    /**
+     * 格式化流式返回中的错误对象。
+     */
     private String formatStreamError(JsonNode error) {
         String code = error.path("code").asText("");
         String message = error.path("message").asText(error.toString());
         if (!code.isEmpty()) {
-            return "模型流式响应出错（code=" + code + "）: " + message;
+            return "模型流式响应出错(code=" + code + "): " + message;
         }
         return "模型流式响应出错: " + message;
     }
 
+    /**
+     * 读取整个输入流为字节数组。
+     */
     private byte[] readFully(InputStream inputStream) throws IOException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
         byte[] buffer = new byte[4096];
@@ -278,9 +380,51 @@ public final class OpenAiProvider implements LlmProvider {
         return outputStream.toByteArray();
     }
 
+    /**
+     * 保存单个工具调用的增量构建状态。
+     */
     private static final class ToolCallBuilder {
         private String id;
         private String name;
         private final StringBuilder arguments = new StringBuilder();
+    }
+
+    /**
+     * 保存流式响应中的用量累积结果。
+     */
+    private static final class UsageHolder {
+        private long inputTokens;
+        private long outputTokens;
+        private long cacheReadTokens;
+
+        /**
+         * 从一条 SSE 事件中提取最新用量字段。
+         */
+        private void capture(JsonNode usageNode) {
+            if (usageNode == null || usageNode.isMissingNode() || usageNode.isNull()) {
+                return;
+            }
+            inputTokens = longValue(usageNode, "prompt_tokens", inputTokens);
+            outputTokens = longValue(usageNode, "completion_tokens", outputTokens);
+            JsonNode details = usageNode.path("prompt_tokens_details");
+            if (!details.isMissingNode() && !details.isNull()) {
+                cacheReadTokens = longValue(details, "cached_tokens", cacheReadTokens);
+            }
+        }
+
+        /**
+         * 读取数值字段；缺失时保留原值。
+         */
+        private long longValue(JsonNode node, String field, long fallback) {
+            JsonNode value = node.path(field);
+            return value.isNumber() ? value.asLong() : fallback;
+        }
+
+        /**
+         * 转换为统一用量对象。
+         */
+        private Usage toUsage() {
+            return new Usage(inputTokens, outputTokens, 0L, cacheReadTokens);
+        }
     }
 }

@@ -1,12 +1,15 @@
 package dev.mewcode.agent.llm;
 
+/**
+ * 表示模型发起的一次工具调用。
+ */
 public final class ToolCall {
     private final String id;
     private final String name;
     private final String inputJson;
 
     /**
-     * 模型发起的一次工具调用，保留 provider 侧 id 以便结果回灌时配对。
+     * 创建一条工具调用记录；空参数会被归一化为 `{}`。
      */
     public ToolCall(String id, String name, String inputJson) {
         this.id = id;
@@ -14,14 +17,23 @@ public final class ToolCall {
         this.inputJson = inputJson == null || inputJson.trim().isEmpty() ? "{}" : inputJson;
     }
 
+    /**
+     * 返回工具调用唯一标识。
+     */
     public String id() {
         return id;
     }
 
+    /**
+     * 返回目标工具名。
+     */
     public String name() {
         return name;
     }
 
+    /**
+     * 返回工具参数 JSON。
+     */
     public String inputJson() {
         return inputJson;
     }

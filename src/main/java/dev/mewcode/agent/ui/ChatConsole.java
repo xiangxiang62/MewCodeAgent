@@ -5,6 +5,7 @@ import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.Role;
 import dev.mewcode.agent.prompt.Prompt;
+import dev.mewcode.agent.prompt.Reminder;
 import dev.mewcode.agent.runtime.ToolAgent;
 import dev.mewcode.agent.runtime.ToolDisplay;
 import dev.mewcode.agent.tool.Registry;
@@ -22,6 +23,9 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * 终端交互界面，负责输入、输出和模式切换。
+ */
 public final class ChatConsole {
     private static final String RESET = "\u001B[0m";
     private static final String BOLD = "\u001B[1m";
@@ -35,12 +39,18 @@ public final class ChatConsole {
     private final Path configPath;
     private final LlmConfig llmConfig;
 
+    /**
+     * 创建终端会话对象。
+     */
     public ChatConsole(String appName, Path configPath, LlmConfig llmConfig) {
         this.appName = appName;
         this.configPath = configPath;
         this.llmConfig = llmConfig;
     }
 
+    /**
+     * 启动交互循环，持续读取用户输入并驱动代理执行。
+     */
     public void run(List<ChatMessage> messages, LlmProvider provider, Registry registry) throws Exception {
         ToolAgent.Mode mode = ToolAgent.Mode.NORMAL;
         try (Terminal terminal = TerminalBuilder.builder()
@@ -75,7 +85,7 @@ public final class ChatConsole {
                 if ("/clear".equalsIgnoreCase(trimmed)) {
                     mode = ToolAgent.Mode.NORMAL;
                     messages.clear();
-                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.SYSTEM_PROMPT));
+                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.buildSystemPrompt()));
                     messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
                     terminal.writer().println("对话上下文已重置。");
                     terminal.writer().flush();
@@ -91,7 +101,7 @@ public final class ChatConsole {
                 if ("/do".equalsIgnoreCase(trimmed)) {
                     mode = ToolAgent.Mode.NORMAL;
                     messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
-                    messages.add(new ChatMessage(Role.USER, Prompt.EXECUTE_DIRECTIVE));
+                    messages.add(new ChatMessage(Role.USER, Reminder.EXECUTE_DIRECTIVE));
                     terminal.writer().print("MewCode: ");
                     terminal.writer().flush();
                     runAgent(messages, provider, registry, terminal, mode);
@@ -110,8 +120,11 @@ public final class ChatConsole {
         }
     }
 
+    /**
+     * 调用代理执行当前一轮对话，并把文本增量直接写回终端。
+     */
     private void runAgent(List<ChatMessage> messages, LlmProvider provider, Registry registry,
-                          Terminal terminal, ToolAgent.Mode mode) {
+            Terminal terminal, ToolAgent.Mode mode) {
         ToolAgent agent = new ToolAgent(provider, registry);
         try {
             agent.run(messages, text -> {
@@ -125,6 +138,9 @@ public final class ChatConsole {
         }
     }
 
+    /**
+     * 控制工具调用在终端中的显示格式。
+     */
     private static final class ConsoleToolDisplay implements ToolDisplay {
         private static final int SUMMARY_LINES = 8;
         private static final Map<String, String> TOOL_LABELS = createToolLabels();
@@ -132,10 +148,16 @@ public final class ChatConsole {
         private final Terminal terminal;
         private final Map<String, RunningTool> runningTools = new ConcurrentHashMap<String, RunningTool>();
 
+        /**
+         * 创建工具显示器。
+         */
         private ConsoleToolDisplay(Terminal terminal) {
             this.terminal = terminal;
         }
 
+        /**
+         * 打印工具开始执行的提示，并启动耗时计时器。
+         */
         @Override
         public void onToolStart(String name, String args) {
             String key = toolKey(name, args);
@@ -151,6 +173,9 @@ public final class ChatConsole {
             runningTool.start(terminal);
         }
 
+        /**
+         * 打印工具执行结果摘要和用时信息。
+         */
         @Override
         public void onToolEnd(String name, String args, String result, boolean error) {
             String key = toolKey(name, args);
@@ -172,15 +197,24 @@ public final class ChatConsole {
             terminal.writer().flush();
         }
 
+        /**
+         * 生成工具运行实例的唯一键。
+         */
         private String toolKey(String name, String args) {
             return name + "\n" + args;
         }
 
+        /**
+         * 返回工具的中文显示名。
+         */
         private String toolLabel(String name) {
             String label = TOOL_LABELS.get(name);
             return label == null ? name : label;
         }
 
+        /**
+         * 创建内置工具中文标签映射。
+         */
         private static Map<String, String> createToolLabels() {
             Map<String, String> labels = new HashMap<String, String>();
             labels.put("read_file", "读取文件");
@@ -193,11 +227,17 @@ public final class ChatConsole {
         }
     }
 
+    /**
+     * 用于在工具执行期间持续打印耗时信息。
+     */
     private static final class RunningTool {
         private final long startedAt = System.currentTimeMillis();
         private final AtomicBoolean active = new AtomicBoolean(true);
         private Thread ticker;
 
+        /**
+         * 启动后台计时线程。
+         */
         private void start(final Terminal terminal) {
             ticker = new Thread(new Runnable() {
                 @Override
@@ -223,6 +263,9 @@ public final class ChatConsole {
             ticker.start();
         }
 
+        /**
+         * 停止计时线程并返回总耗时秒数。
+         */
         private long finish() {
             active.set(false);
             if (ticker != null) {
@@ -237,9 +280,13 @@ public final class ChatConsole {
         }
     }
 
+    /**
+     * 打印启动横幅和当前配置信息。
+     */
     private void printHeader(Terminal terminal, LlmProvider provider) {
         terminal.writer().println();
-        terminal.writer().println(CYAN + " /\\_/\\\\  " + RESET + BOLD + appName + RESET + " " + DIM + "Coding Agent" + RESET);
+        terminal.writer().println(CYAN + " /\\_/\\\\  " + RESET + BOLD + appName + RESET + " " + DIM
+                + "Coding Agent" + RESET);
         terminal.writer().println(MAGENTA + "( o.o ) " + RESET + "chat 启动成功");
         terminal.writer().println(YELLOW + " > ^ <  " + RESET + DIM + "终端纯对话模式" + RESET);
         terminal.writer().println();

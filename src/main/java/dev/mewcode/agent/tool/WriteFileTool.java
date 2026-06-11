@@ -8,6 +8,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
 
+/**
+ * 写入整个文件内容；若目录不存在则自动创建。
+ */
 public final class WriteFileTool implements Tool {
     @Override
     public String name() {
@@ -33,6 +36,9 @@ public final class WriteFileTool implements Tool {
         return false;
     }
 
+    /**
+     * 将给定文本完整写入目标文件，并在必要时补齐父目录。
+     */
     @Override
     public Result execute(ToolContext context, String inputJson) {
         try {

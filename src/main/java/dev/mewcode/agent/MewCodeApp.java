@@ -22,7 +22,7 @@ public final class MewCodeApp {
     }
 
     /**
-     * 程序主入口：解析配置、创建 LLM Provider，然后启动终端聊天循环。
+     * 程序主入口：解析配置、创建模型提供方，并启动终端对话循环。
      */
     public static void main(String[] args) throws Exception {
         Path configPath = resolveConfigPath(args);
@@ -44,8 +44,8 @@ public final class MewCodeApp {
             System.exit(2);
             return;
         }
-        List<ChatMessage> messages = new ArrayList<>();
-        messages.add(new ChatMessage(Role.SYSTEM, Prompt.SYSTEM_PROMPT));
+        List<ChatMessage> messages = new ArrayList<ChatMessage>();
+        messages.add(new ChatMessage(Role.SYSTEM, Prompt.buildSystemPrompt()));
         messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
         Registry registry = Registry.defaultRegistry();
 
@@ -54,7 +54,8 @@ public final class MewCodeApp {
     }
 
     /**
-     * 解析配置文件路径。优先使用显式参数，其次环境变量，最后查找常见默认位置。
+     * 解析配置文件路径。
+     * 优先级依次为：命令行参数、环境变量、常见默认位置。
      */
     private static Path resolveConfigPath(String[] args) {
         if (args.length > 0) {
@@ -82,7 +83,7 @@ public final class MewCodeApp {
     }
 
     /**
-     * 打印配置文件缺失时的引导信息，避免用户只看到异常栈。
+     * 在找不到配置时输出启动说明，帮助用户快速定位配置来源。
      */
     private static void printConfigHelp() {
         System.err.println("未找到 MewCode 配置文件。");
