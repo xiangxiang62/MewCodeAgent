@@ -6,9 +6,13 @@ import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.LlmProviderFactory;
 import dev.mewcode.agent.llm.Role;
+import dev.mewcode.agent.mcp.McpConfig;
+import dev.mewcode.agent.mcp.McpManager;
+import dev.mewcode.agent.mcp.McpStatus;
 import dev.mewcode.agent.permission.PermissionEngine;
 import dev.mewcode.agent.prompt.Prompt;
 import dev.mewcode.agent.tool.Registry;
+import dev.mewcode.agent.tool.Tool;
 import dev.mewcode.agent.ui.ChatConsole;
 
 import java.nio.file.Files;
@@ -17,6 +21,9 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public final class MewCodeApp {
     private MewCodeApp() {
@@ -49,10 +56,66 @@ public final class MewCodeApp {
         messages.add(new ChatMessage(Role.SYSTEM, Prompt.buildSystemPrompt()));
         messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
         Registry registry = Registry.defaultRegistry();
-        PermissionEngine permissionEngine = PermissionEngine.create(Paths.get("").toAbsolutePath());
+        Path projectRoot = resolveProjectRoot(configPath);
+        McpConfig mcpConfig = dev.mewcode.agent.mcp.ConfigLoader.loadConfig(projectRoot);
+        PermissionEngine permissionEngine = PermissionEngine.create(projectRoot);
+        McpStatus mcpStatus = createInitialMcpStatus(mcpConfig);
 
-        ChatConsole console = new ChatConsole("MewCode", configPath, config.llm(), permissionEngine);
+        ExecutorService mcpLoader = Executors.newSingleThreadExecutor(r -> {
+            Thread thread = new Thread(r, "mcp-loader");
+            thread.setDaemon(true);
+            return thread;
+        });
+        Future<McpManager> mcpFuture = McpManager.startAsync(mcpConfig, "0.1.0-SNAPSHOT", mcpLoader);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                if (mcpFuture.isDone()) {
+                    mcpFuture.get().close();
+                }
+            } catch (Exception ignored) {
+                // 退出阶段只做兜底清理，不影响主流程退出。
+            } finally {
+                mcpLoader.shutdownNow();
+            }
+        }, "mcp-shutdown"));
+
+        ChatConsole console = new ChatConsole("MewCode", configPath, config.llm(), permissionEngine,
+                projectRoot, mcpStatus);
+        startBackgroundMcpAttach(registry, mcpFuture, mcpLoader, mcpStatus);
         console.run(messages, provider, registry);
+    }
+
+    /**
+     * 终端启动后再在后台补挂 MCP，尽量缩短首屏等待时间。
+     */
+    private static void startBackgroundMcpAttach(Registry registry, Future<McpManager> mcpFuture,
+            ExecutorService mcpLoader, McpStatus mcpStatus) {
+        mcpLoader.submit(() -> {
+            try {
+                McpManager manager = mcpFuture.get();
+                for (Tool tool : manager.tools()) {
+                    registry.register(tool);
+                }
+                mcpStatus.update(buildConnectedSummary(manager.serverCount(), manager.tools().size()));
+            } catch (Exception e) {
+                mcpStatus.update("MCP 后台加载失败，可继续使用内置工具");
+                System.err.println("[mcp] warn: background attach failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private static McpStatus createInitialMcpStatus(McpConfig mcpConfig) {
+        if (mcpConfig == null || mcpConfig.servers().isEmpty()) {
+            return new McpStatus("未配置 MCP server");
+        }
+        return new McpStatus("正在后台连接 MCP，可先使用内置工具");
+    }
+
+    private static String buildConnectedSummary(int serverCount, int toolCount) {
+        if (serverCount <= 0) {
+            return "MCP 检查完成，未连接到可用 server";
+        }
+        return "已连接 " + serverCount + " 个 MCP server，已注册 " + toolCount + " 个工具";
     }
 
     /**
@@ -82,6 +145,26 @@ public final class MewCodeApp {
             }
         }
         return null;
+    }
+
+    /**
+     * 根据配置文件位置推断项目根目录，优先让项目级配置跟随实际项目而不是启动时 cwd。
+     */
+    private static Path resolveProjectRoot(Path configPath) {
+        Path cwd = Paths.get("").toAbsolutePath().normalize();
+        if (configPath == null) {
+            return cwd;
+        }
+
+        Path absoluteConfigPath = configPath.toAbsolutePath().normalize();
+        Path configParent = absoluteConfigPath.getParent();
+        if (configParent == null) {
+            return cwd;
+        }
+        if (Files.exists(configParent.resolve(".mewcode.yaml"))) {
+            return configParent;
+        }
+        return cwd;
     }
 
     /**

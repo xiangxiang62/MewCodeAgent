@@ -1,0 +1,21 @@
+mcp_servers:
+  # 文档查询（优先尝试这个）
+  context7:
+    type: stdio
+    command: cmd
+    args:
+      - /c
+      - npx
+      - -y
+      - "@upstash/context7-mcp@latest"
+
+  # 本地文件系统
+  filesystem:
+    type: stdio
+    command: cmd
+    args:
+      - /c
+      - npx
+      - -y
+      - "@modelcontextprotocol/server-filesystem"
+      - "D:/AI-Project"

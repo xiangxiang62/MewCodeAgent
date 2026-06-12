@@ -5,6 +5,7 @@ import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.Role;
 import dev.mewcode.agent.llm.ToolCall;
+import dev.mewcode.agent.mcp.McpStatus;
 import dev.mewcode.agent.permission.Mode;
 import dev.mewcode.agent.permission.Outcome;
 import dev.mewcode.agent.permission.PermissionEngine;
@@ -57,6 +58,8 @@ public final class ChatConsole {
     private final Path configPath;
     private final LlmConfig llmConfig;
     private final PermissionEngine permissionEngine;
+    private final Path projectRoot;
+    private final McpStatus mcpStatus;
 
     /**
      * 审批按键后续字节读取器，便于在单元测试中模拟不同终端键序列。
@@ -68,11 +71,14 @@ public final class ChatConsole {
     /**
      * 创建终端会话对象。
      */
-    public ChatConsole(String appName, Path configPath, LlmConfig llmConfig, PermissionEngine permissionEngine) {
+    public ChatConsole(String appName, Path configPath, LlmConfig llmConfig, PermissionEngine permissionEngine,
+            Path projectRoot, McpStatus mcpStatus) {
         this.appName = appName;
         this.configPath = configPath;
         this.llmConfig = llmConfig;
         this.permissionEngine = permissionEngine;
+        this.projectRoot = projectRoot;
+        this.mcpStatus = mcpStatus;
     }
 
     /**
@@ -90,6 +96,7 @@ public final class ChatConsole {
                     .appName(appName)
                     .build();
             installModeKeyBinding(reader, modeState);
+            installMcpStatusListener(reader, terminal);
 
             printHeader(terminal, provider, modeState.current());
             terminal.writer().flush();
@@ -152,7 +159,27 @@ public final class ChatConsole {
                 terminal.writer().println();
                 terminal.writer().flush();
             }
+        } finally {
+            if (mcpStatus != null) {
+                mcpStatus.setListener(null);
+            }
         }
+    }
+
+    /**
+     * 监听后台 MCP 加载状态，并在终端中增量提示。
+     */
+    private void installMcpStatusListener(LineReader reader, Terminal terminal) {
+        if (mcpStatus == null) {
+            return;
+        }
+        mcpStatus.setListener(summary -> {
+            synchronized (terminal) {
+                reader.printAbove(GRAY + "  MCP   " + safeText(summary) + RESET);
+                refreshPrompt(reader);
+                terminal.writer().flush();
+            }
+        });
     }
 
     /**
@@ -614,9 +641,12 @@ public final class ChatConsole {
         terminal.writer().println(GRAY + "----------------------------------------------------------------" + RESET);
         terminal.writer().println("  模式   " + modeBadge(mode) + " " + modeDescription(mode));
         terminal.writer().println("  模型   " + safeText(llmConfig.model()));
+        terminal.writer().println("  项目   " + safeText(String.valueOf(projectRoot)));
         terminal.writer().println("  协议   " + safeText(llmConfig.protocol()) + GRAY + "  |  提供商   "
                 + safeText(provider.name()) + RESET);
         terminal.writer().println("  配置   " + safeText(String.valueOf(configPath)));
+        terminal.writer().println(GRAY + "----------------------------------------------------------------" + RESET);
+        terminal.writer().println(GRAY + "  MCP   " + safeText(mcpStatus == null ? "" : mcpStatus.summary()) + RESET);
         terminal.writer().println(GRAY + "----------------------------------------------------------------" + RESET);
         terminal.writer().println(GRAY
                 + "  /plan 进入规划  /do 执行规划  /clear 清空上下文  /exit 退出  Shift+Tab / Alt+M 切换模式"

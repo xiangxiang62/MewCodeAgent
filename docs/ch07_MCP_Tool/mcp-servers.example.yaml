@@ -1,0 +1,33 @@
+# 项目级放在 <root>/.mewcode.yaml
+# 用户级放在 ~/.mewcode/config.yaml
+# 同名 server 由项目级完整覆盖用户级
+# 仅 env / headers 的值支持 ${VAR} 展开
+
+mcp_servers:
+  github:
+    type: stdio
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-github"
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+
+  local-sqlite:
+    type: stdio
+    command: python
+    args:
+      - -m
+      - mcp_server_sqlite
+      - --db
+      - ./data.db
+
+  example-http:
+    type: http
+    url: "https://mcp.example.com/mcp"
+    headers:
+      Authorization: "Bearer ${EXAMPLE_TOKEN}"
+  context7:
+    type: stdio
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]

@@ -19,23 +19,27 @@ public final class Registry {
     private final Map<String, Tool> tools = new HashMap<String, Tool>();
 
     /**
-     * 注册一个工具，并保留首次注册时的展示顺序。
+     * 注册一个工具，并保留首次注册时的显示顺序。
      */
     public void register(Tool tool) {
         if (tool == null) {
             throw new IllegalArgumentException("tool 不能为空");
         }
-        if (!tools.containsKey(tool.name())) {
-            order.add(tool.name());
+        synchronized (this) {
+            if (!tools.containsKey(tool.name())) {
+                order.add(tool.name());
+            }
+            tools.put(tool.name(), tool);
         }
-        tools.put(tool.name(), tool);
     }
 
     /**
      * 按名称查找工具。
      */
     public Optional<Tool> get(String name) {
-        return Optional.ofNullable(tools.get(name));
+        synchronized (this) {
+            return Optional.ofNullable(tools.get(name));
+        }
     }
 
     /**
@@ -43,9 +47,11 @@ public final class Registry {
      */
     public List<ToolDefinition> definitions() {
         List<ToolDefinition> definitions = new ArrayList<ToolDefinition>();
-        for (String name : order) {
-            Tool tool = tools.get(name);
-            definitions.add(new ToolDefinition(tool.name(), tool.description(), tool.parameters()));
+        synchronized (this) {
+            for (String name : order) {
+                Tool tool = tools.get(name);
+                definitions.add(new ToolDefinition(tool.name(), tool.description(), tool.parameters()));
+            }
         }
         return definitions;
     }
@@ -55,10 +61,12 @@ public final class Registry {
      */
     public List<ToolDefinition> readOnlyDefinitions() {
         List<ToolDefinition> definitions = new ArrayList<ToolDefinition>();
-        for (String name : order) {
-            Tool tool = tools.get(name);
-            if (tool.readOnly()) {
-                definitions.add(new ToolDefinition(tool.name(), tool.description(), tool.parameters()));
+        synchronized (this) {
+            for (String name : order) {
+                Tool tool = tools.get(name);
+                if (tool.readOnly()) {
+                    definitions.add(new ToolDefinition(tool.name(), tool.description(), tool.parameters()));
+                }
             }
         }
         return definitions;
@@ -68,8 +76,10 @@ public final class Registry {
      * 判断指定工具是否为只读工具。
      */
     public boolean isReadOnly(String name) {
-        Tool tool = tools.get(name);
-        return tool != null && tool.readOnly();
+        synchronized (this) {
+            Tool tool = tools.get(name);
+            return tool != null && tool.readOnly();
+        }
     }
 
     /**
@@ -77,7 +87,10 @@ public final class Registry {
      * 当参数为空时，自动补成空 JSON，避免每个工具重复兜底。
      */
     public Result execute(ToolContext context, String name, String args) {
-        Tool tool = tools.get(name);
+        Tool tool;
+        synchronized (this) {
+            tool = tools.get(name);
+        }
         if (tool == null) {
             return Result.error("未知工具: " + name);
         }

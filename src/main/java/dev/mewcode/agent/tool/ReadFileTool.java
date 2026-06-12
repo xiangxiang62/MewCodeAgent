@@ -19,7 +19,7 @@ public final class ReadFileTool implements Tool {
     @Override
     public String description() {
         return "Use this tool to read one local text file. Choose it when the user wants to open, inspect, quote, "
-                + "review, or summarize a specific file such as README.md, pom.xml, or docs/toolSystem/spec.md. "
+                + "review, or summarize a specific file such as README.md, pom.xml, or docs/ch03_ToolSystem/spec.md. "
                 + "Do not use it for searching many files by name or content; use glob or grep for that. "
                 + "Required parameter: path.";
     }
@@ -27,7 +27,7 @@ public final class ReadFileTool implements Tool {
     @Override
     public Map<String, Object> parameters() {
         return Schema.object(Schema.required("path"),
-                "path", "string", "Exact local file path to read, for example README.md or docs/toolSystem/spec.md.");
+                "path", "string", "Exact local file path to read, for example README.md or docs/ch03_ToolSystem/spec.md.");
     }
 
     @Override

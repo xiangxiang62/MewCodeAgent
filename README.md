@@ -75,13 +75,13 @@ java -jar target\mewcode-agent-0.1.0-SNAPSHOT.jar config.yaml
 
 ## English
 
-MewCode is a Java command-line AI assistant. The current version only implements interactive multi-turn chat: no tool use, no file operations, and no code editing.
+MewCode is a Java command-line AI assistant. The current version only implements interactive ch01_Multi-turn chat: no tool use, no file operations, and no code editing.
 
 ### Features
 
 - Interactive terminal chat UI
 - SSE streaming output
-- In-process multi-turn conversation memory
+- In-process ch01_Multi-turn conversation memory
 - Unified Provider abstraction for future LLM backends
 - OpenAI Chat Completions protocol
 - Anthropic Claude Messages protocol
