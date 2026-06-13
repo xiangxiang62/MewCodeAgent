@@ -22,7 +22,8 @@ public class ConfigLoaderTest {
                 + "  model: gpt-4.1-mini\n"
                 + "  base_url: https://api.openai.com/v1\n"
                 + "  api_key: test-key\n"
-                + "  max_tokens: 123\n");
+                + "  max_tokens: 123\n"
+                + "  context_window: 88888\n");
 
         AppConfig loaded = ConfigLoader.load(config);
 
@@ -31,6 +32,7 @@ public class ConfigLoaderTest {
         assertEquals("https://api.openai.com/v1", loaded.llm().baseUrl());
         assertEquals("test-key", loaded.llm().apiKey());
         assertEquals(123, loaded.llm().effectiveMaxTokens());
+        assertEquals(88888, loaded.llm().effectiveContextWindow());
     }
 
     /**
@@ -50,6 +52,24 @@ public class ConfigLoaderTest {
         } catch (IllegalArgumentException e) {
             assertTrue(e.getMessage().contains("llm.api_key"));
         }
+    }
+
+    /**
+     * 验证未配置上下文窗口时会按协议返回默认值。
+     */
+    @Test
+    public void fallsBackToProtocolDefaultContextWindow() {
+        LlmConfig openai = new LlmConfig();
+        openai.setProtocol("openai");
+        assertEquals(128000, openai.effectiveContextWindow());
+
+        LlmConfig anthropic = new LlmConfig();
+        anthropic.setProtocol("anthropic");
+        assertEquals(200000, anthropic.effectiveContextWindow());
+
+        LlmConfig unknown = new LlmConfig();
+        unknown.setProtocol("custom");
+        assertEquals(200000, unknown.effectiveContextWindow());
     }
 
     /**

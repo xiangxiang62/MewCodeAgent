@@ -57,6 +57,16 @@ public class OpenAiProviderTest {
         assertFalse(payload.containsKey("tool_choice"));
     }
 
+    /**
+     * 验证 OpenAI 侧可识别上下文过长错误文本。
+     */
+    @Test
+    public void detectsPromptTooLongMessage() {
+        assertTrue(OpenAiProvider.looksLikePromptTooLong("prompt_too_long"));
+        assertTrue(OpenAiProvider.looksLikePromptTooLong("maximum context length exceeded"));
+        assertFalse(OpenAiProvider.looksLikePromptTooLong("internal server error"));
+    }
+
     private LlmConfig config() {
         LlmConfig config = new LlmConfig();
         config.setProtocol("openai");

@@ -2,10 +2,18 @@ package dev.mewcode.agent.runtime;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.mewcode.agent.compact.Compact;
+import dev.mewcode.agent.compact.Compact.CompactResult;
+import dev.mewcode.agent.compact.Recovery.RecoveryState;
+import dev.mewcode.agent.compact.Token;
+import dev.mewcode.agent.compact.state.AutoCompactTrackingState;
+import dev.mewcode.agent.compact.state.ContentReplacementState;
+import dev.mewcode.agent.compact.state.SessionContext;
 import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.ChatResponse;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.LlmRequest;
+import dev.mewcode.agent.llm.PromptTooLongException;
 import dev.mewcode.agent.llm.Role;
 import dev.mewcode.agent.llm.StreamCallback;
 import dev.mewcode.agent.llm.ToolCall;
@@ -22,6 +30,9 @@ import dev.mewcode.agent.tool.Registry;
 import dev.mewcode.agent.tool.Result;
 import dev.mewcode.agent.tool.ToolContext;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -32,9 +43,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 串联模型、工具、权限系统和会话历史的主执行器。
+ * 串联模型、工具、权限系统和会话上下文管理的主执行器。
  */
 public final class ToolAgent {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -47,16 +59,45 @@ public final class ToolAgent {
     private final Registry registry;
     private final PermissionEngine permissionEngine;
     private final ApprovalHandler approvalHandler;
+    private final Compact compact;
+    private final RecoveryState recoveryState;
+    private final ReentrantLock runLock = new ReentrantLock();
+
+    private long usageAnchor;
+    private int usageAnchorMessageCount;
 
     /**
-     * 创建一个代理实例。
+     * 创建一个带会话级上下文状态的代理实例。
      */
-    public ToolAgent(LlmProvider provider, Registry registry, PermissionEngine permissionEngine,
-            ApprovalHandler approvalHandler) {
+    public ToolAgent(
+            LlmProvider provider,
+            Registry registry,
+            PermissionEngine permissionEngine,
+            ApprovalHandler approvalHandler,
+            Path workspaceRoot,
+            int contextWindow) throws Exception {
         this.provider = provider;
         this.registry = registry;
         this.permissionEngine = permissionEngine;
         this.approvalHandler = approvalHandler;
+        this.recoveryState = new RecoveryState();
+        this.compact = new Compact(
+                provider,
+                Prompt.buildSystemPrompt(),
+                EnvironmentInfo.gather("0.1.0-SNAPSHOT", provider.model()).render(),
+                new ContentReplacementState(),
+                recoveryState,
+                new AutoCompactTrackingState(),
+                SessionContext.create(workspaceRoot),
+                contextWindow);
+    }
+
+    /**
+     * 兼容旧调用方式，默认使用当前工作目录与保守上下文窗口。
+     */
+    public ToolAgent(LlmProvider provider, Registry registry, PermissionEngine permissionEngine,
+            ApprovalHandler approvalHandler) throws Exception {
+        this(provider, registry, permissionEngine, approvalHandler, Path.of("").toAbsolutePath().normalize(), 200000);
     }
 
     /**
@@ -71,48 +112,101 @@ public final class ToolAgent {
      */
     public String run(List<ChatMessage> messages, StreamCallback callback, ToolDisplay display, Mode mode)
             throws Exception {
-        int unknownRounds = 0;
-        String systemPrompt = Prompt.buildSystemPrompt();
-        String environmentInfo = EnvironmentInfo.gather("0.1.0-SNAPSHOT", provider.model()).render();
-
-        for (int iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-            debug("starting iteration " + iteration + " in mode " + mode.displayName());
-            List<ToolDefinition> definitions = selectDefinitions(mode);
-            String reminder = buildReminder(mode);
-            ChatResponse response = provider.streamChat(
-                    new LlmRequest(buildRequestMessages(messages), definitions, systemPrompt, environmentInfo, reminder),
-                    callback);
-            List<ToolCall> toolCalls = response.toolCalls();
-            debug("iteration " + iteration + " tool call count = " + toolCalls.size());
-
-            if (toolCalls.isEmpty()) {
-                String finalText = ensureAssistantText(response.text(), mode);
-                messages.add(new ChatMessage(Role.ASSISTANT, finalText));
-                return finalText;
-            }
-
-            messages.add(new ChatMessage(Role.ASSISTANT, response.text(), toolCalls,
-                    Collections.<ToolResult>emptyList()));
-            List<ToolResult> results = executeCalls(toolCalls, display, mode);
-            messages.add(new ChatMessage(Role.TOOL, "", Collections.<ToolCall>emptyList(), results));
-
-            if (allUnknown(toolCalls)) {
-                unknownRounds++;
-                if (unknownRounds >= MAX_UNKNOWN_ROUNDS) {
-                    String notice = "已连续多轮请求未注册工具，自动停止本轮执行。";
-                    callback.onText(notice);
-                    messages.add(new ChatMessage(Role.ASSISTANT, notice));
-                    return notice;
+        runLock.lock();
+        try {
+            int unknownRounds = 0;
+            boolean emergencyRetried = false;
+            for (int iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
+                debug("starting iteration " + iteration + " in mode " + mode.displayName());
+                List<ToolDefinition> definitions = selectDefinitions(mode);
+                CompactResult managed = compact.manageContext(messages, definitions, usageAnchor, usageAnchorMessageCount);
+                replaceMessages(messages, managed.messages());
+                String reminder = buildReminder(mode);
+                ChatResponse response;
+                try {
+                    response = provider.streamChat(
+                            new LlmRequest(buildRequestMessages(messages), definitions, compactSystemPrompt(),
+                                    compactEnvironmentInfo(), reminder),
+                            callback);
+                } catch (PromptTooLongException e) {
+                    if (emergencyRetried) {
+                        throw e;
+                    }
+                    emergencyRetried = true;
+                    CompactResult emergency = compact.emergencyCompact(messages, definitions, usageAnchor,
+                            usageAnchorMessageCount);
+                    replaceMessages(messages, emergency.messages());
+                    response = provider.streamChat(
+                            new LlmRequest(buildRequestMessages(messages), definitions, compactSystemPrompt(),
+                                    compactEnvironmentInfo(), reminder),
+                            callback);
                 }
-            } else {
-                unknownRounds = 0;
-            }
-        }
 
-        String capped = "已达到最大迭代轮数，自动停止本轮执行。";
-        callback.onText(capped);
-        messages.add(new ChatMessage(Role.ASSISTANT, capped));
-        return capped;
+                usageAnchor = Token.usageAnchor(response.usage());
+                usageAnchorMessageCount = messages.size();
+
+                List<ToolCall> toolCalls = response.toolCalls();
+                debug("iteration " + iteration + " tool call count = " + toolCalls.size());
+
+                if (toolCalls.isEmpty()) {
+                    String finalText = ensureAssistantText(response.text(), mode);
+                    messages.add(new ChatMessage(Role.ASSISTANT, finalText));
+                    return finalText;
+                }
+
+                messages.add(new ChatMessage(Role.ASSISTANT, response.text(), toolCalls,
+                        Collections.<ToolResult>emptyList()));
+                List<ToolResult> results = executeCalls(toolCalls, display, mode);
+                recordReadFiles(toolCalls, results);
+                messages.add(new ChatMessage(Role.TOOL, "", Collections.<ToolCall>emptyList(), results));
+
+                if (allUnknown(toolCalls)) {
+                    unknownRounds++;
+                    if (unknownRounds >= MAX_UNKNOWN_ROUNDS) {
+                        String notice = "已连续多轮请求未注册工具，自动停止本轮执行。";
+                        callback.onText(notice);
+                        messages.add(new ChatMessage(Role.ASSISTANT, notice));
+                        return notice;
+                    }
+                } else {
+                    unknownRounds = 0;
+                }
+            }
+
+            String capped = "已达到最大迭代轮数，自动停止本轮执行。";
+            callback.onText(capped);
+            messages.add(new ChatMessage(Role.ASSISTANT, capped));
+            return capped;
+        } finally {
+            runLock.unlock();
+        }
+    }
+
+    /**
+     * 无条件执行一次手动压缩。
+     */
+    public ForceCompactResult runForceCompact(List<ChatMessage> messages, Mode mode) {
+        runLock.lock();
+        try {
+            List<ToolDefinition> definitions = selectDefinitions(mode);
+            CompactResult result = compact.forceCompact(messages, definitions, usageAnchor, usageAnchorMessageCount);
+            replaceMessages(messages, result.messages());
+            usageAnchor = 0L;
+            usageAnchorMessageCount = 0;
+            return new ForceCompactResult(result.beforeTokens(), result.afterTokens(), null);
+        } catch (Throwable e) {
+            return new ForceCompactResult(0L, 0L, e);
+        } finally {
+            runLock.unlock();
+        }
+    }
+
+    /**
+     * 用新的消息序列整体替换当前会话历史。
+     */
+    private void replaceMessages(List<ChatMessage> messages, List<ChatMessage> replacement) {
+        messages.clear();
+        messages.addAll(replacement);
     }
 
     /**
@@ -120,6 +214,20 @@ public final class ToolAgent {
      */
     private List<ChatMessage> buildRequestMessages(List<ChatMessage> messages) {
         return new ArrayList<ChatMessage>(messages);
+    }
+
+    /**
+     * 返回压缩器内部复用的系统提示。
+     */
+    private String compactSystemPrompt() {
+        return Prompt.buildSystemPrompt();
+    }
+
+    /**
+     * 返回压缩器内部复用的环境信息。
+     */
+    private String compactEnvironmentInfo() {
+        return EnvironmentInfo.gather("0.1.0-SNAPSHOT", provider.model()).render();
     }
 
     /**
@@ -293,6 +401,9 @@ public final class ToolAgent {
         return new ToolResult(call.id(), result.content(), result.isError());
     }
 
+    /**
+     * 统计本批只读工具中仍需真正执行的数量。
+     */
     private int countRunnableReads(List<ToolResult> results, int start, int end) {
         int count = 0;
         for (int i = start; i < end; i++) {
@@ -333,6 +444,34 @@ public final class ToolAgent {
             return Result.error("工具执行超时: " + call.name());
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    /**
+     * 将成功读取的原始文件内容写入恢复状态，供压缩后恢复段使用。
+     */
+    private void recordReadFiles(List<ToolCall> calls, List<ToolResult> results) {
+        for (int i = 0; i < calls.size() && i < results.size(); i++) {
+            ToolCall call = calls.get(i);
+            ToolResult result = results.get(i);
+            if (call == null || result == null || result.isError() || !"read_file".equals(call.name())) {
+                continue;
+            }
+            try {
+                JsonNode root = JSON.readTree(call.inputJson());
+                JsonNode pathNode = root.get("path");
+                if (pathNode == null || !pathNode.isTextual()) {
+                    continue;
+                }
+                Path path = Path.of(pathNode.asText());
+                if (!Files.exists(path) || Files.isDirectory(path)) {
+                    continue;
+                }
+                String raw = Files.readString(path, StandardCharsets.UTF_8);
+                recoveryState.recordFile(path.toAbsolutePath().normalize().toString(), raw);
+            } catch (Exception e) {
+                debug("record read file failed: " + e.getMessage());
+            }
         }
     }
 

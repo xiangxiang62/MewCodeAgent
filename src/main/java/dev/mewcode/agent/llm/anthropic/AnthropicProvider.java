@@ -8,6 +8,7 @@ import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.ChatResponse;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.LlmRequest;
+import dev.mewcode.agent.llm.PromptTooLongException;
 import dev.mewcode.agent.llm.Role;
 import dev.mewcode.agent.llm.StreamCallback;
 import dev.mewcode.agent.llm.ToolCall;
@@ -131,9 +132,13 @@ public final class AnthropicProvider implements LlmProvider {
     private void ensureSuccess(HttpURLConnection connection) throws IOException {
         int statusCode = connection.getResponseCode();
         if (statusCode < 200 || statusCode >= 300) {
-            throw new IllegalStateException("Anthropic API request failed with HTTP " + statusCode
+            String message = "Anthropic API request failed with HTTP " + statusCode
                     + ", request id: " + valueOrUnknown(connection.getHeaderField("request-id"))
-                    + ", body: " + readErrorBody(connection));
+                    + ", body: " + readErrorBody(connection);
+            if (looksLikePromptTooLong(message)) {
+                throw new PromptTooLongException(message);
+            }
+            throw new IllegalStateException(message);
         }
     }
 
@@ -322,8 +327,26 @@ public final class AnthropicProvider implements LlmProvider {
                 builder.input.append(delta.path("partial_json").asText());
             }
         } catch (Exception e) {
+            if (e instanceof PromptTooLongException) {
+                throw (PromptTooLongException) e;
+            }
             throw new IllegalStateException("Failed to parse Anthropic SSE data: " + data, e);
         }
+    }
+
+    /**
+     * 判断错误文本是否表达了上下文过长。
+     */
+    static boolean looksLikePromptTooLong(String message) {
+        if (message == null) {
+            return false;
+        }
+        String lower = message.toLowerCase();
+        return lower.contains("prompt_too_long")
+                || lower.contains("context length")
+                || lower.contains("maximum context")
+                || lower.contains("too many tokens")
+                || lower.contains("input is too long");
     }
 
     /**

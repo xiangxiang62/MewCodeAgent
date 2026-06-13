@@ -12,6 +12,7 @@ import dev.mewcode.agent.permission.PermissionEngine;
 import dev.mewcode.agent.prompt.Prompt;
 import dev.mewcode.agent.prompt.Reminder;
 import dev.mewcode.agent.runtime.ApprovalHandler;
+import dev.mewcode.agent.runtime.ForceCompactResult;
 import dev.mewcode.agent.runtime.ToolAgent;
 import dev.mewcode.agent.runtime.ToolDisplay;
 import dev.mewcode.agent.tool.Registry;
@@ -60,6 +61,7 @@ public final class ChatConsole {
     private final PermissionEngine permissionEngine;
     private final Path projectRoot;
     private final McpStatus mcpStatus;
+    private ToolAgent sharedAgent;
 
     /**
      * 审批按键后续字节读取器，便于在单元测试中模拟不同终端键序列。
@@ -150,6 +152,18 @@ public final class ChatConsole {
                     runAgent(messages, provider, registry, terminal, modeState.current(), modeState);
                     terminal.writer().println();
                     terminal.writer().flush();
+                    continue;
+                }
+                if ("/compact".equalsIgnoreCase(trimmed)) {
+                    ForceCompactResult result = ensureAgent(provider, registry, terminal, modeState)
+                            .runForceCompact(messages, modeState.current());
+                    if (result.error() != null) {
+                        printNotice(terminal, "压缩失败: " + result.error().getMessage(), modeState.current());
+                    } else {
+                        printNotice(terminal,
+                                "压缩完成，估算 token 从 " + result.before() + " 降到 " + result.after(),
+                                modeState.current());
+                    }
                     continue;
                 }
 
@@ -245,9 +259,8 @@ public final class ChatConsole {
      */
     private void runAgent(List<ChatMessage> messages, LlmProvider provider, Registry registry,
             Terminal terminal, Mode mode, ModeState modeState) {
-        ToolAgent agent = new ToolAgent(provider, registry, permissionEngine,
-                new ConsoleApprovalHandler(terminal, modeState));
         try {
+            ToolAgent agent = ensureAgent(provider, registry, terminal, modeState);
             agent.run(messages, text -> {
                 terminal.writer().print(text);
                 terminal.writer().flush();
@@ -268,6 +281,19 @@ public final class ChatConsole {
 
     private String renderPrompt(Mode mode) {
         return modePrompt(mode) + CYAN + ">" + RESET + " ";
+    }
+
+    /**
+     * 确保当前终端会话只复用一个 ToolAgent 实例。
+     */
+    private ToolAgent ensureAgent(LlmProvider provider, Registry registry, Terminal terminal, ModeState modeState)
+            throws Exception {
+        if (sharedAgent == null) {
+            sharedAgent = new ToolAgent(provider, registry, permissionEngine,
+                    new ConsoleApprovalHandler(terminal, modeState), projectRoot,
+                    llmConfig.effectiveContextWindow());
+        }
+        return sharedAgent;
     }
 
     private void printAssistantLead(Terminal terminal) {

@@ -5,6 +5,8 @@ llm:
   base_url: https://api.openai.com/v1
   api_key: ${OPENAI_API_KEY}
   max_tokens: 4096
+  # 可选：覆盖模型上下文窗口；未配置时按协议默认值推断
+  context_window: 128000
 
   # Anthropic Claude only.
   # thinking:

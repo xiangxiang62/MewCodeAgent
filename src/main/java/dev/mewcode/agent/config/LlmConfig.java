@@ -20,6 +20,9 @@ public final class LlmConfig {
     @JsonProperty("max_tokens")
     private Integer maxTokens;
 
+    @JsonProperty("context_window")
+    private Integer contextWindow;
+
     private ThinkingConfig thinking;
 
     /**
@@ -93,6 +96,20 @@ public final class LlmConfig {
     }
 
     /**
+     * 返回配置中的上下文窗口。
+     */
+    public Integer contextWindow() {
+        return contextWindow;
+    }
+
+    /**
+     * 设置上下文窗口。
+     */
+    public void setContextWindow(Integer contextWindow) {
+        this.contextWindow = contextWindow;
+    }
+
+    /**
      * 返回扩展 thinking 配置。
      */
     public ThinkingConfig thinking() {
@@ -111,5 +128,15 @@ public final class LlmConfig {
      */
     public int effectiveMaxTokens() {
         return maxTokens == null ? 4096 : maxTokens;
+    }
+
+    /**
+     * 返回生效的上下文窗口；未配置时按协议使用默认值。
+     */
+    public int effectiveContextWindow() {
+        if (contextWindow != null && contextWindow.intValue() > 0) {
+            return contextWindow.intValue();
+        }
+        return ProtocolDefaults.defaultContextWindow(protocol);
     }
 }

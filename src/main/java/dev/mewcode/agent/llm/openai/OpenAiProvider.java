@@ -7,6 +7,7 @@ import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.ChatResponse;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.LlmRequest;
+import dev.mewcode.agent.llm.PromptTooLongException;
 import dev.mewcode.agent.llm.StreamCallback;
 import dev.mewcode.agent.llm.ToolCall;
 import dev.mewcode.agent.llm.ToolDefinition;
@@ -124,9 +125,13 @@ public final class OpenAiProvider implements LlmProvider {
     private void ensureSuccess(HttpURLConnection connection) throws IOException {
         int statusCode = connection.getResponseCode();
         if (statusCode < 200 || statusCode >= 300) {
-            throw new IllegalStateException("OpenAI API request failed with HTTP " + statusCode
+            String message = "OpenAI API request failed with HTTP " + statusCode
                     + ", request id: " + valueOrUnknown(connection.getHeaderField("x-request-id"))
-                    + ", body: " + readErrorBody(connection));
+                    + ", body: " + readErrorBody(connection);
+            if (looksLikePromptTooLong(message)) {
+                throw new PromptTooLongException(message);
+            }
+            throw new IllegalStateException(message);
         }
     }
 
@@ -272,7 +277,11 @@ public final class OpenAiProvider implements LlmProvider {
             JsonNode root = JSON.readTree(data);
             JsonNode error = root.path("error");
             if (!error.isMissingNode() && !error.isNull()) {
-                throw new IllegalStateException(formatStreamError(error));
+                String message = formatStreamError(error);
+                if (looksLikePromptTooLong(message)) {
+                    throw new PromptTooLongException(message);
+                }
+                throw new IllegalStateException(message);
             }
             usageHolder.capture(root.path("usage"));
             JsonNode content = root.at("/choices/0/delta/content");
@@ -305,8 +314,26 @@ public final class OpenAiProvider implements LlmProvider {
                 }
             }
         } catch (Exception e) {
+            if (e instanceof PromptTooLongException) {
+                throw (PromptTooLongException) e;
+            }
             throw new IllegalStateException("Failed to parse OpenAI SSE data: " + data, e);
         }
+    }
+
+    /**
+     * 判断错误文本是否表达了上下文过长。
+     */
+    static boolean looksLikePromptTooLong(String message) {
+        if (message == null) {
+            return false;
+        }
+        String lower = message.toLowerCase();
+        return lower.contains("prompt_too_long")
+                || lower.contains("context length")
+                || lower.contains("maximum context")
+                || lower.contains("token limit")
+                || lower.contains("too many tokens");
     }
 
     /**

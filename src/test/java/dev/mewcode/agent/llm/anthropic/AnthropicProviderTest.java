@@ -59,6 +59,16 @@ public class AnthropicProviderTest {
         assertTrue(content.contains("<system-reminder>"));
     }
 
+    /**
+     * 验证 Anthropic 侧可识别上下文过长错误文本。
+     */
+    @Test
+    public void detectsPromptTooLongMessage() {
+        assertTrue(AnthropicProvider.looksLikePromptTooLong("prompt_too_long"));
+        assertTrue(AnthropicProvider.looksLikePromptTooLong("input is too long for context length"));
+        assertFalse(AnthropicProvider.looksLikePromptTooLong("bad gateway"));
+    }
+
     private LlmConfig config() {
         LlmConfig config = new LlmConfig();
         config.setProtocol("anthropic");
