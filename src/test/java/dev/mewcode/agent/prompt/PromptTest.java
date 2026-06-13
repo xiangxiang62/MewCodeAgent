@@ -45,4 +45,12 @@ public class PromptTest {
         assertTrue(prompt.indexOf("Prefer dedicated tools") < prompt.indexOf("EXTRA"));
         assertTrue(prompt.indexOf("EXTRA") < prompt.indexOf("Answer in concise Chinese"));
     }
+
+    @Test
+    public void insertsInstructionsAndMemoryModulesWhenProvided() {
+        String prompt = Prompt.buildSystemPrompt("PROJECT_RULE", "MEMORY_INDEX");
+        assertTrue(prompt.contains("PROJECT_RULE"));
+        assertTrue(prompt.contains("MEMORY_INDEX"));
+        assertTrue(prompt.indexOf("PROJECT_RULE") < prompt.indexOf("MEMORY_INDEX"));
+    }
 }

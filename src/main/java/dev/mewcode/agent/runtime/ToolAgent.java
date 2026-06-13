@@ -19,6 +19,7 @@ import dev.mewcode.agent.llm.StreamCallback;
 import dev.mewcode.agent.llm.ToolCall;
 import dev.mewcode.agent.llm.ToolDefinition;
 import dev.mewcode.agent.llm.ToolResult;
+import dev.mewcode.agent.memory.Manager;
 import dev.mewcode.agent.permission.Decision;
 import dev.mewcode.agent.permission.Mode;
 import dev.mewcode.agent.permission.Outcome;
@@ -26,6 +27,7 @@ import dev.mewcode.agent.permission.PermissionEngine;
 import dev.mewcode.agent.prompt.EnvironmentInfo;
 import dev.mewcode.agent.prompt.Prompt;
 import dev.mewcode.agent.prompt.Reminder;
+import dev.mewcode.agent.session.Writer;
 import dev.mewcode.agent.tool.Registry;
 import dev.mewcode.agent.tool.Result;
 import dev.mewcode.agent.tool.ToolContext;
@@ -46,7 +48,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 串联模型、工具、权限系统和会话上下文管理的主执行器。
+ * 串联模型、工具、权限和会话状态的主执行器。
  */
 public final class ToolAgent {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -62,12 +64,20 @@ public final class ToolAgent {
     private final Compact compact;
     private final RecoveryState recoveryState;
     private final ReentrantLock runLock = new ReentrantLock();
+    private final String instructionText;
+    private final String environmentInfo;
+    private final String modelName;
+    private final Manager memoryManager;
 
+    private volatile String memoryText;
+    private volatile Writer sessionWriter;
+    private volatile SessionContext sessionContext;
     private long usageAnchor;
     private int usageAnchorMessageCount;
+    private long turnCount;
 
     /**
-     * 创建一个带会话级上下文状态的代理实例。
+     * 创建一个默认代理实例。
      */
     public ToolAgent(
             LlmProvider provider,
@@ -76,24 +86,50 @@ public final class ToolAgent {
             ApprovalHandler approvalHandler,
             Path workspaceRoot,
             int contextWindow) throws Exception {
+        this(provider, registry, permissionEngine, approvalHandler, workspaceRoot, contextWindow, "", "", null, null,
+                null);
+    }
+
+    /**
+     * 创建一个带指令注入、会话存档和长期记忆能力的代理实例。
+     */
+    public ToolAgent(
+            LlmProvider provider,
+            Registry registry,
+            PermissionEngine permissionEngine,
+            ApprovalHandler approvalHandler,
+            Path workspaceRoot,
+            int contextWindow,
+            String instructionText,
+            String memoryText,
+            Manager memoryManager,
+            SessionContext sessionContext,
+            Writer sessionWriter) throws Exception {
         this.provider = provider;
         this.registry = registry;
         this.permissionEngine = permissionEngine;
         this.approvalHandler = approvalHandler;
         this.recoveryState = new RecoveryState();
+        this.instructionText = instructionText == null ? "" : instructionText;
+        this.memoryText = memoryText == null ? "" : memoryText;
+        this.environmentInfo = EnvironmentInfo.gather("0.1.0-SNAPSHOT", provider.model()).render();
+        this.modelName = provider.model();
+        this.memoryManager = memoryManager;
+        this.sessionContext = sessionContext == null ? SessionContext.create(workspaceRoot) : sessionContext;
+        this.sessionWriter = sessionWriter;
         this.compact = new Compact(
                 provider,
-                Prompt.buildSystemPrompt(),
-                EnvironmentInfo.gather("0.1.0-SNAPSHOT", provider.model()).render(),
+                Prompt.buildSystemPrompt(this.instructionText, this.memoryText),
+                environmentInfo,
                 new ContentReplacementState(),
                 recoveryState,
                 new AutoCompactTrackingState(),
-                SessionContext.create(workspaceRoot),
+                this.sessionContext,
                 contextWindow);
     }
 
     /**
-     * 兼容旧调用方式，默认使用当前工作目录与保守上下文窗口。
+     * 兼容旧调用方式。
      */
     public ToolAgent(LlmProvider provider, Registry registry, PermissionEngine permissionEngine,
             ApprovalHandler approvalHandler) throws Exception {
@@ -101,14 +137,14 @@ public final class ToolAgent {
     }
 
     /**
-     * 以默认模式运行一轮代理流程。
+     * 以默认模式运行一轮代理流。
      */
     public String run(List<ChatMessage> messages, StreamCallback callback, ToolDisplay display) throws Exception {
         return run(messages, callback, display, Mode.DEFAULT);
     }
 
     /**
-     * 按指定模式执行多轮“模型决策 -> 工具调用 -> 结果回灌”循环。
+     * 执行多轮“模型判断 -> 工具调用 -> 结果回灌”的代理循环。
      */
     public String run(List<ChatMessage> messages, StreamCallback callback, ToolDisplay display, Mode mode)
             throws Exception {
@@ -150,22 +186,32 @@ public final class ToolAgent {
 
                 if (toolCalls.isEmpty()) {
                     String finalText = ensureAssistantText(response.text(), mode);
-                    messages.add(new ChatMessage(Role.ASSISTANT, finalText));
+                    ChatMessage assistant = new ChatMessage(Role.ASSISTANT, finalText);
+                    messages.add(assistant);
+                    persistMessage(assistant);
+                    triggerMemoryUpdate(messages);
                     return finalText;
                 }
 
-                messages.add(new ChatMessage(Role.ASSISTANT, response.text(), toolCalls,
-                        Collections.<ToolResult>emptyList()));
+                ChatMessage assistant = new ChatMessage(Role.ASSISTANT, response.text(), toolCalls,
+                        Collections.<ToolResult>emptyList());
+                messages.add(assistant);
+                persistMessage(assistant);
+
                 List<ToolResult> results = executeCalls(toolCalls, display, mode);
                 recordReadFiles(toolCalls, results);
-                messages.add(new ChatMessage(Role.TOOL, "", Collections.<ToolCall>emptyList(), results));
+                ChatMessage toolMessage = new ChatMessage(Role.TOOL, "", Collections.<ToolCall>emptyList(), results);
+                messages.add(toolMessage);
+                persistMessage(toolMessage);
 
                 if (allUnknown(toolCalls)) {
                     unknownRounds++;
                     if (unknownRounds >= MAX_UNKNOWN_ROUNDS) {
                         String notice = "已连续多轮请求未注册工具，自动停止本轮执行。";
                         callback.onText(notice);
-                        messages.add(new ChatMessage(Role.ASSISTANT, notice));
+                        ChatMessage stopMessage = new ChatMessage(Role.ASSISTANT, notice);
+                        messages.add(stopMessage);
+                        persistMessage(stopMessage);
                         return notice;
                     }
                 } else {
@@ -175,7 +221,9 @@ public final class ToolAgent {
 
             String capped = "已达到最大迭代轮数，自动停止本轮执行。";
             callback.onText(capped);
-            messages.add(new ChatMessage(Role.ASSISTANT, capped));
+            ChatMessage cappedMessage = new ChatMessage(Role.ASSISTANT, capped);
+            messages.add(cappedMessage);
+            persistMessage(cappedMessage);
             return capped;
         } finally {
             runLock.unlock();
@@ -202,32 +250,57 @@ public final class ToolAgent {
     }
 
     /**
-     * 用新的消息序列整体替换当前会话历史。
+     * 恢复到已有 session，并让后续消息继续写入该 JSONL。
+     */
+    public void resumeSession(SessionContext sessionContext, Writer sessionWriter, List<ChatMessage> messages) {
+        this.sessionContext = sessionContext;
+        this.sessionWriter = sessionWriter;
+        this.usageAnchor = 0L;
+        this.usageAnchorMessageCount = messages == null ? 0 : messages.size();
+    }
+
+    /**
+     * 更新当前注入给系统提示的记忆索引文本。
+     */
+    public void updateMemoryText(String memoryText) {
+        this.memoryText = memoryText == null ? "" : memoryText;
+    }
+
+    /**
+     * 判断当前代理是否仍在执行中。
+     */
+    public boolean isRunning() {
+        return runLock.isLocked();
+    }
+
+    /**
+     * 用新消息序列整体替换当前会话历史。
      */
     private void replaceMessages(List<ChatMessage> messages, List<ChatMessage> replacement) {
         messages.clear();
         messages.addAll(replacement);
+        persistReplacement(replacement);
     }
 
     /**
-     * 为本轮请求复制一份消息快照，避免外部列表在请求途中继续变化。
+     * 复制请求消息，避免调用过程中外部列表变化。
      */
     private List<ChatMessage> buildRequestMessages(List<ChatMessage> messages) {
         return new ArrayList<ChatMessage>(messages);
     }
 
     /**
-     * 返回压缩器内部复用的系统提示。
+     * 返回压缩器复用的系统提示。
      */
     private String compactSystemPrompt() {
-        return Prompt.buildSystemPrompt();
+        return Prompt.buildSystemPrompt(instructionText, memoryText);
     }
 
     /**
-     * 返回压缩器内部复用的环境信息。
+     * 返回压缩器复用的环境信息。
      */
     private String compactEnvironmentInfo() {
-        return EnvironmentInfo.gather("0.1.0-SNAPSHOT", provider.model()).render();
+        return environmentInfo;
     }
 
     /**
@@ -241,7 +314,7 @@ public final class ToolAgent {
     }
 
     /**
-     * 根据模式选择当前轮允许模型调用的工具集合。
+     * 根据模式选择本轮允许的工具集合。
      */
     private List<ToolDefinition> selectDefinitions(Mode mode) {
         if (mode == Mode.PLAN) {
@@ -276,7 +349,7 @@ public final class ToolAgent {
     }
 
     /**
-     * 执行本轮工具调用，并把结果转换成模型可消费的结构。
+     * 执行本轮工具调用，并把结果转换成模型可消费结构。
      */
     private List<ToolResult> executeCalls(List<ToolCall> calls, ToolDisplay display, Mode mode) {
         List<ToolResult> results = new ArrayList<ToolResult>(Collections.nCopies(calls.size(), (ToolResult) null));
@@ -294,14 +367,14 @@ public final class ToolAgent {
     }
 
     /**
-     * 仅在非计划模式下，把连续只读工具归并成一批并发执行。
+     * 在非计划模式下，把连续只读工具并发执行。
      */
     private boolean canRunReadOnlyBatch(ToolCall call, Mode mode) {
         return mode != Mode.PLAN && registry.isReadOnly(call.name());
     }
 
     /**
-     * 并发执行一段连续只读工具，同时保证展示顺序和结果回灌顺序不变。
+     * 并发执行一段连续只读工具，同时保持展示与回灌顺序。
      */
     private int executeReadOnlyBatch(List<ToolCall> calls, List<ToolResult> results, ToolDisplay display, Mode mode,
             int start) {
@@ -425,7 +498,7 @@ public final class ToolAgent {
     }
 
     /**
-     * 为单次工具调用施加超时保护，防止卡住整个代理循环。
+     * 为单次工具调用施加超时保护。
      */
     private Result executeWithTimeout(final ToolCall call, AtomicBoolean cancelled) {
         ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -448,7 +521,7 @@ public final class ToolAgent {
     }
 
     /**
-     * 将成功读取的原始文件内容写入恢复状态，供压缩后恢复段使用。
+     * 将成功读取的原始文件内容写入恢复状态，供压缩后恢复。
      */
     private void recordReadFiles(List<ToolCall> calls, List<ToolResult> results) {
         for (int i = 0; i < calls.size() && i < results.size(); i++) {
@@ -476,14 +549,14 @@ public final class ToolAgent {
     }
 
     /**
-     * 从工具参数中挑选一个适合展示的关键字段，减少终端噪声。
+     * 从工具参数中提取适合终端展示的摘要字段。
      */
     private String previewArgs(ToolCall call) {
         try {
             JsonNode root = JSON.readTree(call.inputJson());
             String[] keys = { "path", "command", "pattern", "old_string" };
-            for (int i = 0; i < keys.length; i++) {
-                JsonNode value = root.get(keys[i]);
+            for (String key : keys) {
+                JsonNode value = root.get(key);
                 if (value != null && value.isTextual()) {
                     return truncate(value.asText(), 80);
                 }
@@ -505,11 +578,85 @@ public final class ToolAgent {
     }
 
     /**
-     * 在调试开关开启时输出内部日志。
+     * 在调试开关打开时输出内部日志。
      */
     private void debug(String message) {
         if (DEBUG_TOOL_CALLS) {
             System.err.println("[MewCode][ToolAgent] " + message);
         }
+    }
+
+    /**
+     * 将单条消息写入当前 session JSONL。
+     */
+    private void persistMessage(ChatMessage message) {
+        if (sessionWriter == null || message == null) {
+            return;
+        }
+        try {
+            sessionWriter.append(message, modelName, true);
+        } catch (Exception e) {
+            debug("persist message failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 在压缩替换后写入 compact 标记并追加新的消息快照。
+     */
+    private void persistReplacement(List<ChatMessage> replacement) {
+        if (sessionWriter == null || replacement == null || replacement.isEmpty()) {
+            return;
+        }
+        try {
+            sessionWriter.writeCompactMarker();
+            sessionWriter.appendAll(replacement);
+        } catch (Exception e) {
+            debug("persist replacement failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 在对话自然停下后按策略触发异步记忆更新。
+     */
+    private void triggerMemoryUpdate(List<ChatMessage> messages) {
+        if (memoryManager == null) {
+            return;
+        }
+        turnCount++;
+        List<ChatMessage> recent = extractRecentTurn(messages);
+        if (turnCount % 5 == 0 || hasMemorySignal(recent)) {
+            memoryManager.updateAsync(recent);
+        }
+    }
+
+    /**
+     * 提取最近一轮从最后一个用户消息开始的消息片段。
+     */
+    private List<ChatMessage> extractRecentTurn(List<ChatMessage> messages) {
+        int start = 0;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (messages.get(i).role() == Role.USER) {
+                start = i;
+                break;
+            }
+        }
+        return new ArrayList<ChatMessage>(messages.subList(start, messages.size()));
+    }
+
+    /**
+     * 检测最近用户消息中是否包含显式记忆信号。
+     */
+    private boolean hasMemorySignal(List<ChatMessage> messages) {
+        for (ChatMessage message : messages) {
+            if (message.role() != Role.USER) {
+                continue;
+            }
+            String content = message.content() == null ? "" : message.content().toLowerCase();
+            if (content.contains("记住") || content.contains("记忆") || content.contains("别忘")
+                    || content.contains("remember") || content.contains("memo")) {
+                return true;
+            }
+        }
+        return false;
     }
 }

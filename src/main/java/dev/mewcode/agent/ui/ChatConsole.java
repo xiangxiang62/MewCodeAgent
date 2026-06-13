@@ -1,11 +1,13 @@
 package dev.mewcode.agent.ui;
 
+import dev.mewcode.agent.compact.state.SessionContext;
 import dev.mewcode.agent.config.LlmConfig;
 import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.Role;
 import dev.mewcode.agent.llm.ToolCall;
 import dev.mewcode.agent.mcp.McpStatus;
+import dev.mewcode.agent.memory.Manager;
 import dev.mewcode.agent.permission.Mode;
 import dev.mewcode.agent.permission.Outcome;
 import dev.mewcode.agent.permission.PermissionEngine;
@@ -15,6 +17,10 @@ import dev.mewcode.agent.runtime.ApprovalHandler;
 import dev.mewcode.agent.runtime.ForceCompactResult;
 import dev.mewcode.agent.runtime.ToolAgent;
 import dev.mewcode.agent.runtime.ToolDisplay;
+import dev.mewcode.agent.session.SessionInfo;
+import dev.mewcode.agent.session.SessionList;
+import dev.mewcode.agent.session.SessionLoader;
+import dev.mewcode.agent.session.Writer;
 import dev.mewcode.agent.tool.Registry;
 import org.jline.keymap.KeyMap;
 import org.jline.reader.Binding;
@@ -32,6 +38,8 @@ import org.jline.utils.InfoCmp;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,7 +69,14 @@ public final class ChatConsole {
     private final PermissionEngine permissionEngine;
     private final Path projectRoot;
     private final McpStatus mcpStatus;
+    private final String instructionText;
+    private final Manager memoryManager;
+    private final Path sessionsDir;
+
     private ToolAgent sharedAgent;
+    private String memoryText;
+    private SessionContext sessionContext;
+    private Writer sessionWriter;
 
     /**
      * 审批按键后续字节读取器，便于在单元测试中模拟不同终端键序列。
@@ -74,13 +89,20 @@ public final class ChatConsole {
      * 创建终端会话对象。
      */
     public ChatConsole(String appName, Path configPath, LlmConfig llmConfig, PermissionEngine permissionEngine,
-            Path projectRoot, McpStatus mcpStatus) {
+            Path projectRoot, McpStatus mcpStatus, String instructionText, Manager memoryManager, String memoryText,
+            SessionContext sessionContext, Writer sessionWriter) {
         this.appName = appName;
         this.configPath = configPath;
         this.llmConfig = llmConfig;
         this.permissionEngine = permissionEngine;
         this.projectRoot = projectRoot;
         this.mcpStatus = mcpStatus;
+        this.instructionText = instructionText == null ? "" : instructionText;
+        this.memoryManager = memoryManager;
+        this.memoryText = memoryText == null ? "" : memoryText;
+        this.sessionContext = sessionContext;
+        this.sessionWriter = sessionWriter;
+        this.sessionsDir = projectRoot.resolve(".mewcode").resolve("sessions");
     }
 
     /**
@@ -111,7 +133,7 @@ public final class ChatConsole {
                     input = reader.readLine(renderPrompt(modeState.current()));
                 } catch (ModeSwitchException e) {
                     modeState.endInput();
-                    printNotice(terminal, "模式已切换到 " + modeBadge(modeState.current()) + " "
+                    printNotice(terminal, "模式已切换到 " + shortModeName(modeState.current()) + " "
                             + modeDescription(modeState.current()) + "。", modeState.current());
                     continue;
                 } catch (UserInterruptException | EndOfFileException e) {
@@ -132,22 +154,29 @@ public final class ChatConsole {
                 if ("/clear".equalsIgnoreCase(trimmed)) {
                     modeState.set(Mode.DEFAULT);
                     messages.clear();
-                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.buildSystemPrompt()));
+                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.buildSystemPrompt(instructionText, memoryText)));
                     messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
+                    recreateSession(messages, provider.model());
                     printNotice(terminal, "已清空上下文。", modeState.current());
                     continue;
                 }
                 if ("/plan".equalsIgnoreCase(trimmed)) {
                     modeState.set(Mode.PLAN);
-                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_PLAN));
-                    printNotice(terminal, "已切换到 " + modeBadge(modeState.current()) + " "
+                    ChatMessage planMessage = new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_PLAN);
+                    messages.add(planMessage);
+                    appendCurrentMessage(planMessage, provider.model());
+                    printNotice(terminal, "已切换到 " + shortModeName(modeState.current()) + " "
                             + modeDescription(modeState.current()) + "。", modeState.current());
                     continue;
                 }
                 if ("/do".equalsIgnoreCase(trimmed)) {
                     modeState.set(Mode.DEFAULT);
-                    messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
-                    messages.add(new ChatMessage(Role.USER, Reminder.EXECUTE_DIRECTIVE));
+                    ChatMessage normalMessage = new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL);
+                    ChatMessage directiveMessage = new ChatMessage(Role.USER, Reminder.EXECUTE_DIRECTIVE);
+                    messages.add(normalMessage);
+                    messages.add(directiveMessage);
+                    appendCurrentMessage(normalMessage, provider.model());
+                    appendCurrentMessage(directiveMessage, provider.model());
                     printAssistantLead(terminal);
                     runAgent(messages, provider, registry, terminal, modeState.current(), modeState);
                     terminal.writer().println();
@@ -166,8 +195,14 @@ public final class ChatConsole {
                     }
                     continue;
                 }
+                if ("/resume".equalsIgnoreCase(trimmed)) {
+                    handleResume(messages, provider, registry, terminal, modeState);
+                    continue;
+                }
 
-                messages.add(new ChatMessage(Role.USER, input));
+                ChatMessage userMessage = new ChatMessage(Role.USER, input);
+                messages.add(userMessage);
+                appendCurrentMessage(userMessage, provider.model());
                 printAssistantLead(terminal);
                 runAgent(messages, provider, registry, terminal, modeState.current(), modeState);
                 terminal.writer().println();
@@ -177,11 +212,18 @@ public final class ChatConsole {
             if (mcpStatus != null) {
                 mcpStatus.setListener(null);
             }
+            if (sessionWriter != null) {
+                try {
+                    sessionWriter.close();
+                } catch (Exception ignored) {
+                    // 退出时尽力关闭即可。
+                }
+            }
         }
     }
 
     /**
-     * 监听后台 MCP 加载状态，并在终端中增量提示。
+     * 监听后台 MCP 状态，并在终端中增量提示。
      */
     private void installMcpStatusListener(LineReader reader, Terminal terminal) {
         if (mcpStatus == null) {
@@ -205,7 +247,7 @@ public final class ChatConsole {
     }
 
     /**
-     * 安装模式切换快捷键，支持 Shift+Tab，也提供 Alt+M 兜底。
+     * 安装模式切换快捷键。
      */
     private void installModeKeyBinding(final LineReader reader, final ModeState modeState) {
         Widget cycleModeWidget = new Widget() {
@@ -220,7 +262,7 @@ public final class ChatConsole {
                 if (modeState.isReadingInput()) {
                     throw new ModeSwitchException();
                 }
-                reader.printAbove(GRAY + "模式已切换到 " + modeBadge(modeState.current()) + " "
+                reader.printAbove(GRAY + "模式已切换到 " + shortModeName(modeState.current()) + " "
                         + modeDescription(modeState.current()) + "。" + RESET);
                 refreshPrompt(reader);
                 return true;
@@ -231,21 +273,24 @@ public final class ChatConsole {
     }
 
     /**
-     * 强制刷新当前输入行，避免模式切换后 prompt 停留在旧状态。
+     * 强制刷新当前输入行。
      */
     private void refreshPrompt(LineReader reader) {
         try {
             reader.callWidget(LineReader.REDRAW_LINE);
         } catch (Exception ignored) {
-            // 某些终端不支持时忽略，后续的重显仍能兜底。
+            // 某些终端不支持时忽略。
         }
         try {
             reader.callWidget(LineReader.REDISPLAY);
         } catch (Exception ignored) {
-            // 某些终端不支持时忽略，后续的重显仍能兜底。
+            // 某些终端不支持时忽略。
         }
     }
 
+    /**
+     * 为所有 keymap 绑定同一组快捷键。
+     */
     private void bindAllKeyMaps(LineReader reader, Reference reference, String... keySequences) {
         for (KeyMap<Binding> keyMap : reader.getKeyMaps().values()) {
             for (String keySequence : keySequences) {
@@ -265,6 +310,14 @@ public final class ChatConsole {
                 terminal.writer().print(text);
                 terminal.writer().flush();
             }, new ConsoleToolDisplay(terminal), mode);
+            if (memoryManager != null) {
+                try {
+                    memoryText = memoryManager.loadIndex();
+                    agent.updateMemoryText(memoryText);
+                } catch (Exception ignored) {
+                    // 记忆刷新失败时不打断主流程。
+                }
+            }
         } catch (Exception e) {
             terminal.writer().println();
             terminal.writer().println(RED + "请求失败: " + e.getMessage() + RESET);
@@ -272,6 +325,123 @@ public final class ChatConsole {
         }
     }
 
+    /**
+     * 处理 /resume，按编号恢复历史会话。
+     */
+    private void handleResume(List<ChatMessage> messages, LlmProvider provider, Registry registry, Terminal terminal,
+            ModeState modeState) {
+        try {
+            if (sharedAgent != null && sharedAgent.isRunning()) {
+                printNotice(terminal, "请等待当前任务完成。", modeState.current());
+                return;
+            }
+            List<SessionInfo> sessions = SessionList.list(sessionsDir);
+            if (sessions.isEmpty()) {
+                printNotice(terminal, "没有可恢复的历史会话。", modeState.current());
+                return;
+            }
+            terminal.writer().println();
+            terminal.writer().println(GRAY + "历史会话：" + RESET);
+            for (int i = 0; i < sessions.size(); i++) {
+                SessionInfo info = sessions.get(i);
+                terminal.writer().println(GRAY + "  [" + (i + 1) + "] " + RESET + safeText(info.title())
+                        + GRAY + "  " + info.id() + "  " + formatAgo(info.modifiedAt()) + RESET);
+            }
+            terminal.writer().flush();
+            LineReader selector = LineReaderBuilder.builder()
+                    .terminal(terminal)
+                    .appName(appName)
+                    .build();
+            String raw = selector.readLine(GRAY + "输入编号恢复，直接回车取消" + RESET + "\n" + renderPrompt(modeState.current()));
+            if (raw == null || raw.trim().isEmpty()) {
+                printNotice(terminal, "已取消恢复。", modeState.current());
+                return;
+            }
+            int index = Integer.parseInt(raw.trim()) - 1;
+            if (index < 0 || index >= sessions.size()) {
+                printNotice(terminal, "恢复编号无效。", modeState.current());
+                return;
+            }
+            SessionInfo selected = sessions.get(index);
+            List<ChatMessage> restored = SessionLoader.load(selected.dir());
+            SessionContext restoredContext = SessionContext.open(projectRoot, selected.id());
+            Writer restoredWriter = Writer.open(selected.dir());
+            if (sessionWriter != null) {
+                sessionWriter.close();
+            }
+            sessionWriter = restoredWriter;
+            sessionContext = restoredContext;
+            messages.clear();
+            messages.addAll(restored);
+            if (Duration.between(selected.modifiedAt(), Instant.now()).toHours() >= 6) {
+                ChatMessage reminder = new ChatMessage(Role.SYSTEM, "提示：这是一个较早前的会话，继续前请先确认上下文是否仍然有效。");
+                messages.add(reminder);
+                appendCurrentMessage(reminder, provider.model());
+            }
+            if (memoryManager != null) {
+                memoryText = memoryManager.loadIndex();
+            }
+            ToolAgent agent = ensureAgent(provider, registry, terminal, modeState);
+            agent.updateMemoryText(memoryText);
+            agent.resumeSession(restoredContext, restoredWriter, messages);
+            printNotice(terminal, "已恢复会话 " + selected.id() + "，共 " + restored.size() + " 条消息。", modeState.current());
+        } catch (Exception e) {
+            printNotice(terminal, "恢复会话失败: " + e.getMessage(), modeState.current());
+        }
+    }
+
+    /**
+     * 确保当前会话只复用一个 ToolAgent。
+     */
+    private ToolAgent ensureAgent(LlmProvider provider, Registry registry, Terminal terminal, ModeState modeState)
+            throws Exception {
+        if (sharedAgent == null) {
+            sharedAgent = new ToolAgent(provider, registry, permissionEngine,
+                    new ConsoleApprovalHandler(terminal, modeState), projectRoot,
+                    llmConfig.effectiveContextWindow(), instructionText, memoryText, memoryManager, sessionContext,
+                    sessionWriter);
+        }
+        return sharedAgent;
+    }
+
+    /**
+     * 清空上下文时重建 session，并重写系统消息。
+     */
+    private void recreateSession(List<ChatMessage> messages, String model) {
+        try {
+            if (sessionWriter != null) {
+                sessionWriter.close();
+            }
+            sessionContext = SessionContext.create(projectRoot);
+            sessionWriter = Writer.create(sessionContext.sessionDir());
+            for (ChatMessage message : messages) {
+                sessionWriter.append(message, model, true);
+            }
+            if (sharedAgent != null) {
+                sharedAgent.resumeSession(sessionContext, sessionWriter, messages);
+            }
+        } catch (Exception ignored) {
+            // 重建失败时保持交互继续。
+        }
+    }
+
+    /**
+     * 将新增消息写入当前会话 JSONL。
+     */
+    private void appendCurrentMessage(ChatMessage message, String model) {
+        if (sessionWriter == null || message == null) {
+            return;
+        }
+        try {
+            sessionWriter.append(message, model, true);
+        } catch (Exception ignored) {
+            // 落盘失败不影响继续使用。
+        }
+    }
+
+    /**
+     * 打印提示信息。
+     */
     private void printNotice(Terminal terminal, String message, Mode mode) {
         terminal.writer().println();
         terminal.writer().println(GRAY + message + RESET);
@@ -279,28 +449,24 @@ public final class ChatConsole {
         terminal.writer().flush();
     }
 
+    /**
+     * 渲染当前输入提示符。
+     */
     private String renderPrompt(Mode mode) {
         return modePrompt(mode) + CYAN + ">" + RESET + " ";
     }
 
     /**
-     * 确保当前终端会话只复用一个 ToolAgent 实例。
+     * 输出助手前缀。
      */
-    private ToolAgent ensureAgent(LlmProvider provider, Registry registry, Terminal terminal, ModeState modeState)
-            throws Exception {
-        if (sharedAgent == null) {
-            sharedAgent = new ToolAgent(provider, registry, permissionEngine,
-                    new ConsoleApprovalHandler(terminal, modeState), projectRoot,
-                    llmConfig.effectiveContextWindow());
-        }
-        return sharedAgent;
-    }
-
     private void printAssistantLead(Terminal terminal) {
         terminal.writer().print(BOLD + "MewCode" + RESET + GRAY + " > " + RESET);
         terminal.writer().flush();
     }
 
+    /**
+     * 返回模式徽标。
+     */
     private String modeBadge(Mode mode) {
         if (mode == Mode.ACCEPT_EDITS) {
             return GREEN + "[ACCEPT EDITS]" + RESET;
@@ -314,6 +480,9 @@ public final class ChatConsole {
         return CYAN + "[DEFAULT]" + RESET;
     }
 
+    /**
+     * 返回 prompt 中显示的模式名称。
+     */
     private String modePrompt(Mode mode) {
         if (mode == Mode.ACCEPT_EDITS) {
             return GREEN + "accept-edits" + RESET + DIM + "(自动确认写文件)" + RESET + " ";
@@ -327,6 +496,9 @@ public final class ChatConsole {
         return CYAN + "default" + RESET + DIM + "(标准确认)" + RESET + " ";
     }
 
+    /**
+     * 返回简短模式名。
+     */
     private String shortModeName(Mode mode) {
         if (mode == Mode.ACCEPT_EDITS) {
             return "ACCEPT EDITS";
@@ -340,6 +512,9 @@ public final class ChatConsole {
         return "DEFAULT";
     }
 
+    /**
+     * 返回模式说明。
+     */
     private String modeDescription(Mode mode) {
         if (mode == Mode.ACCEPT_EDITS) {
             return "允许直接修改文件，执行命令仍需确认";
@@ -416,7 +591,7 @@ public final class ChatConsole {
         }
 
         /**
-         * 直接解析审批阶段的按键流，兼容 ANSI 序列、Windows 扩展键码和字符键。
+         * 解析审批阶段的按键流。
          */
         private String readApprovalAction() {
             try {
@@ -436,6 +611,9 @@ public final class ChatConsole {
             }
         }
 
+        /**
+         * 渲染审批框内容。
+         */
         private void renderApproval(ToolCall call, String argsPreview, String reason, int selected) {
             String[] lines = new String[] {
                     "",
@@ -455,6 +633,9 @@ public final class ChatConsole {
             rewriteFrame(lines);
         }
 
+        /**
+         * 以覆盖方式重绘审批框。
+         */
         private void rewriteFrame(String[] lines) {
             if (lastRenderLines > 0) {
                 terminal.writer().print(cursorUp(lastRenderLines));
@@ -473,6 +654,9 @@ public final class ChatConsole {
             lastRenderLines = lines.length;
         }
 
+        /**
+         * 清理审批框显示区域。
+         */
         private void clearApprovalFrame() {
             if (lastRenderLines <= 0) {
                 return;
@@ -487,20 +671,32 @@ public final class ChatConsole {
             lastRenderLines = 0;
         }
 
+        /**
+         * 渲染一条审批选项。
+         */
         private String approvalOption(boolean active, String index, String title, String desc) {
             String prefix = active ? CYAN + "  > " + RESET : "    ";
             String label = active ? BOLD + "[" + index + "] " + title + RESET : "[" + index + "] " + title;
             return prefix + label + GRAY + "  " + desc + RESET;
         }
 
+        /**
+         * 计算下一个选中项。
+         */
         private int nextIndex(int selected) {
             return (selected + 1) % 3;
         }
 
+        /**
+         * 计算上一个选中项。
+         */
         private int previousIndex(int selected) {
             return (selected + 2) % 3;
         }
 
+        /**
+         * 将选中索引映射为审批结果。
+         */
         private Outcome outcomeFor(int selected) {
             if (selected == 1) {
                 return Outcome.ALLOW_FOREVER;
@@ -563,25 +759,40 @@ public final class ChatConsole {
             printAssistantLeadStatic(terminal);
         }
 
+        /**
+         * 输出工具结束后的助手前缀。
+         */
         private static void printAssistantLeadStatic(Terminal terminal) {
             terminal.writer().print(BOLD + "MewCode" + RESET + GRAY + " > " + RESET);
             terminal.writer().flush();
         }
 
+        /**
+         * 为运行中的工具生成唯一键。
+         */
         private String toolKey(String name, String args) {
             return name + "\n" + args;
         }
 
+        /**
+         * 将工具名映射为中文标签。
+         */
         private String toolLabel(String name) {
             String label = TOOL_LABELS.get(name);
             return label == null ? name : label;
         }
 
+        /**
+         * 裁剪结果行长度，避免终端刷屏。
+         */
         private String trimLine(String line) {
             String text = safeText(line);
             return text.length() <= 120 ? text : text.substring(0, 117) + "...";
         }
 
+        /**
+         * 初始化内置工具中文名称。
+         */
         private static Map<String, String> createToolLabels() {
             Map<String, String> labels = new HashMap<String, String>();
             labels.put("read_file", "读取文件");
@@ -595,13 +806,16 @@ public final class ChatConsole {
     }
 
     /**
-     * 在工具执行期间打印简短的耗时提示。
+     * 在工具执行期间打印简短耗时提示。
      */
     private static final class RunningTool {
         private final long startedAt = System.currentTimeMillis();
         private final AtomicBoolean active = new AtomicBoolean(true);
         private Thread ticker;
 
+        /**
+         * 启动一个后台 ticker，定期刷新耗时。
+         */
         private void start(final Terminal terminal, final String label) {
             ticker = new Thread(new Runnable() {
                 @Override
@@ -628,6 +842,9 @@ public final class ChatConsole {
             ticker.start();
         }
 
+        /**
+         * 停止 ticker，并返回总耗时秒数。
+         */
         private long finish() {
             active.set(false);
             if (ticker != null) {
@@ -642,11 +859,17 @@ public final class ChatConsole {
         }
     }
 
+    /**
+     * 清理一行临时输出。
+     */
     private static void clearTransientLine(Terminal terminal) {
         terminal.writer().print("\r" + CLEAR_LINE);
         terminal.writer().flush();
     }
 
+    /**
+     * 生成光标上移控制序列。
+     */
     private static String cursorUp(int lines) {
         if (lines <= 0) {
             return "";
@@ -655,7 +878,7 @@ public final class ChatConsole {
     }
 
     /**
-     * 打印启动头部和当前配置信息。
+     * 打印启动头部和当前配置。
      */
     private void printHeader(Terminal terminal, LlmProvider provider, Mode mode) {
         terminal.writer().println();
@@ -675,11 +898,14 @@ public final class ChatConsole {
         terminal.writer().println(GRAY + "  MCP   " + safeText(mcpStatus == null ? "" : mcpStatus.summary()) + RESET);
         terminal.writer().println(GRAY + "----------------------------------------------------------------" + RESET);
         terminal.writer().println(GRAY
-                + "  /plan 进入规划  /do 执行规划  /clear 清空上下文  /exit 退出  Shift+Tab / Alt+M 切换模式"
+                + "  /plan 进入规划  /do 执行规划  /resume 恢复会话  /clear 清空上下文  /exit 退出  Shift+Tab / Alt+M 切换模式"
                 + RESET);
         terminal.writer().println();
     }
 
+    /**
+     * 将工具名映射为中文。
+     */
     private static String toolLabel(String toolName) {
         if ("read_file".equals(toolName)) {
             return "读取文件";
@@ -702,6 +928,9 @@ public final class ChatConsole {
         return toolName;
     }
 
+    /**
+     * 对终端文本做安全清洗。
+     */
     private static String safeText(String text) {
         if (text == null) {
             return "";
@@ -710,7 +939,7 @@ public final class ChatConsole {
     }
 
     /**
-     * 将审批阶段读取到的按键字节流翻译成统一动作，兼容 Windows 扩展键和 ANSI 序列。
+     * 将审批阶段读到的按键字节流翻译成统一动作。
      */
     static String decodeApprovalAction(int first, ApprovalByteReader reader) throws Exception {
         if (first < 0) {
@@ -735,7 +964,6 @@ public final class ChatConsole {
             return "SUBMIT";
         }
 
-        // Windows 控制台常见扩展键：0/224 + 72(上) / 80(下)
         if (first == 0 || first == 224) {
             int second = reader.read(25L);
             if (second == 72) {
@@ -768,7 +996,7 @@ public final class ChatConsole {
     }
 
     /**
-     * 在指定超时时间内读取下一个输入字节，避免方向键半包时永久阻塞。
+     * 在限定时间内读取下一个输入字节。
      */
     static int readInputByteWithTimeout(InputStream in, long timeoutMillis) throws Exception {
         long deadline = System.currentTimeMillis() + timeoutMillis;
@@ -782,7 +1010,21 @@ public final class ChatConsole {
     }
 
     /**
-     * 持有当前模式，便于快捷键和主循环共享更新。
+     * 将时间转换为“多久之前”形式。
+     */
+    private String formatAgo(Instant modifiedAt) {
+        Duration duration = Duration.between(modifiedAt, Instant.now());
+        if (duration.toMinutes() < 60) {
+            return Math.max(0L, duration.toMinutes()) + " 分钟前";
+        }
+        if (duration.toHours() < 24) {
+            return duration.toHours() + " 小时前";
+        }
+        return duration.toDays() + " 天前";
+    }
+
+    /**
+     * 保存当前模式状态，供主循环和快捷键共享。
      */
     private static final class ModeState {
         private Mode current;
@@ -814,7 +1056,7 @@ public final class ChatConsole {
     }
 
     /**
-     * 用于中断当前 readLine，让主循环按新模式重新创建 prompt。
+     * 用于中断当前 readLine，让主循环按新模式重建 prompt。
      */
     private static final class ModeSwitchException extends RuntimeException {
         private static final long serialVersionUID = 1L;

@@ -24,9 +24,16 @@ public final class Prompt {
      * 构建完整稳定系统提示词。
      */
     public static String buildSystemPrompt() {
+        return buildSystemPrompt("", "");
+    }
+
+    /**
+     * 构建完整系统提示词，并注入项目指令与长期记忆索引。
+     */
+    public static String buildSystemPrompt(String instructions, String memory) {
         List<PromptModule> modules = new ArrayList<PromptModule>();
         modules.addAll(fixedModules());
-        modules.addAll(optionalModules());
+        modules.addAll(optionalModules(instructions, memory));
         return assembleSystem(modules);
     }
 
@@ -77,10 +84,17 @@ public final class Prompt {
      * 返回可选模块占位；为空时会在装配阶段自动跳过。
      */
     public static List<PromptModule> optionalModules() {
+        return optionalModules("", "");
+    }
+
+    /**
+     * 返回可选模块，并按传入内容填充自定义指令与长期记忆。
+     */
+    public static List<PromptModule> optionalModules(String instructions, String memory) {
         List<PromptModule> modules = new ArrayList<PromptModule>();
-        modules.add(new PromptModule("custom-instructions", 80, ""));
+        modules.add(new PromptModule("custom-instructions", 80, instructions));
         modules.add(new PromptModule("active-skills", 90, ""));
-        modules.add(new PromptModule("long-term-memory", 100, ""));
+        modules.add(new PromptModule("long-term-memory", 100, memory));
         return modules;
     }
 }

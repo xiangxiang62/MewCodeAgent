@@ -2,22 +2,28 @@ package dev.mewcode.agent;
 
 import dev.mewcode.agent.config.AppConfig;
 import dev.mewcode.agent.config.ConfigLoader;
+import dev.mewcode.agent.instructions.Loader;
 import dev.mewcode.agent.llm.ChatMessage;
 import dev.mewcode.agent.llm.LlmProvider;
 import dev.mewcode.agent.llm.LlmProviderFactory;
 import dev.mewcode.agent.llm.Role;
+import dev.mewcode.agent.memory.Manager;
 import dev.mewcode.agent.mcp.McpConfig;
 import dev.mewcode.agent.mcp.McpManager;
 import dev.mewcode.agent.mcp.McpStatus;
 import dev.mewcode.agent.permission.PermissionEngine;
 import dev.mewcode.agent.prompt.Prompt;
+import dev.mewcode.agent.session.SessionCleaner;
+import dev.mewcode.agent.session.Writer;
 import dev.mewcode.agent.tool.Registry;
 import dev.mewcode.agent.tool.Tool;
 import dev.mewcode.agent.ui.ChatConsole;
+import dev.mewcode.agent.compact.state.SessionContext;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -52,11 +58,24 @@ public final class MewCodeApp {
             System.exit(2);
             return;
         }
-        List<ChatMessage> messages = new ArrayList<ChatMessage>();
-        messages.add(new ChatMessage(Role.SYSTEM, Prompt.buildSystemPrompt()));
-        messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
-        Registry registry = Registry.defaultRegistry();
         Path projectRoot = resolveProjectRoot(configPath);
+        Loader instructionLoader = new Loader(projectRoot);
+        String instructionText = instructionLoader.load();
+        Manager memoryManager = new Manager(projectRoot.resolve(".mewcode").resolve("memory"),
+                Paths.get(System.getProperty("user.home")).resolve(".mewcode").resolve("memory"),
+                provider,
+                config.llm().model());
+        String memoryText = memoryManager.loadIndex();
+        SessionContext sessionContext = SessionContext.create(projectRoot);
+        Writer sessionWriter = Writer.create(sessionContext.sessionDir());
+        SessionCleaner.cleanExpired(projectRoot.resolve(".mewcode").resolve("sessions"), Duration.ofDays(30));
+
+        List<ChatMessage> messages = new ArrayList<ChatMessage>();
+        messages.add(new ChatMessage(Role.SYSTEM, Prompt.buildSystemPrompt(instructionText, memoryText)));
+        messages.add(new ChatMessage(Role.SYSTEM, Prompt.MODE_STATUS_NORMAL));
+        sessionWriter.append(messages.get(0), config.llm().model(), true);
+        sessionWriter.append(messages.get(1), config.llm().model(), true);
+        Registry registry = Registry.defaultRegistry();
         McpConfig mcpConfig = dev.mewcode.agent.mcp.ConfigLoader.loadConfig(projectRoot);
         PermissionEngine permissionEngine = PermissionEngine.create(projectRoot);
         McpStatus mcpStatus = createInitialMcpStatus(mcpConfig);
@@ -80,7 +99,7 @@ public final class MewCodeApp {
         }, "mcp-shutdown"));
 
         ChatConsole console = new ChatConsole("MewCode", configPath, config.llm(), permissionEngine,
-                projectRoot, mcpStatus);
+                projectRoot, mcpStatus, instructionText, memoryManager, memoryText, sessionContext, sessionWriter);
         startBackgroundMcpAttach(registry, mcpFuture, mcpLoader, mcpStatus);
         console.run(messages, provider, registry);
     }
