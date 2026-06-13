@@ -304,12 +304,24 @@ public final class ChatConsole {
      */
     private void runAgent(List<ChatMessage> messages, LlmProvider provider, Registry registry,
             Terminal terminal, Mode mode, ModeState modeState) {
+        ThinkingIndicator thinkingIndicator = null;
         try {
             ToolAgent agent = ensureAgent(provider, registry, terminal, modeState);
+            thinkingIndicator = new ThinkingIndicator(terminal);
+            thinkingIndicator.start();
+            final ThinkingIndicator finalThinkingIndicator = thinkingIndicator;
             agent.run(messages, text -> {
+                if (text != null && !text.isEmpty()) {
+                    finalThinkingIndicator.markOutputStarted();
+                }
                 terminal.writer().print(text);
                 terminal.writer().flush();
-            }, new ConsoleToolDisplay(terminal), mode);
+            }, new ConsoleToolDisplay(terminal, new Runnable() {
+                @Override
+                public void run() {
+                    finalThinkingIndicator.markOutputStarted();
+                }
+            }), mode);
             if (memoryManager != null) {
                 try {
                     memoryText = memoryManager.loadIndex();
@@ -319,9 +331,16 @@ public final class ChatConsole {
                 }
             }
         } catch (Exception e) {
+            if (thinkingIndicator != null) {
+                thinkingIndicator.stop();
+            }
             terminal.writer().println();
             terminal.writer().println(RED + "请求失败: " + e.getMessage() + RESET);
             terminal.writer().flush();
+            return;
+        }
+        if (thinkingIndicator != null) {
+            thinkingIndicator.stop();
         }
     }
 
@@ -460,8 +479,15 @@ public final class ChatConsole {
      * 输出助手前缀。
      */
     private void printAssistantLead(Terminal terminal) {
-        terminal.writer().print(BOLD + "MewCode" + RESET + GRAY + " > " + RESET);
+        terminal.writer().print(assistantLeadText());
         terminal.writer().flush();
+    }
+
+    /**
+     * 杩斿洖鍔╂墜鍓嶇紑鏂囨湰锛屼究浜庡湪鍚屼竴涓牱寮忎笅澶氬澶嶇敤銆?
+     */
+    private static String assistantLeadText() {
+        return BOLD + "MewCode" + RESET + GRAY + " > " + RESET;
     }
 
     /**
@@ -716,14 +742,19 @@ public final class ChatConsole {
         private static final Map<String, String> TOOL_LABELS = createToolLabels();
 
         private final Terminal terminal;
+        private final Runnable onVisibleOutput;
         private final Map<String, RunningTool> runningTools = new ConcurrentHashMap<String, RunningTool>();
 
-        private ConsoleToolDisplay(Terminal terminal) {
+        private ConsoleToolDisplay(Terminal terminal, Runnable onVisibleOutput) {
             this.terminal = terminal;
+            this.onVisibleOutput = onVisibleOutput;
         }
 
         @Override
         public void onToolStart(String name, String args) {
+            if (onVisibleOutput != null) {
+                onVisibleOutput.run();
+            }
             String key = toolKey(name, args);
             RunningTool runningTool = new RunningTool();
             runningTools.put(key, runningTool);
@@ -763,7 +794,7 @@ public final class ChatConsole {
          * 输出工具结束后的助手前缀。
          */
         private static void printAssistantLeadStatic(Terminal terminal) {
-            terminal.writer().print(BOLD + "MewCode" + RESET + GRAY + " > " + RESET);
+            terminal.writer().print(assistantLeadText());
             terminal.writer().flush();
         }
 
@@ -862,6 +893,107 @@ public final class ChatConsole {
     /**
      * 清理一行临时输出。
      */
+    private static final class ThinkingIndicator {
+        private static final String[] FRAMES = new String[] {
+                "正在思考   ",
+                "正在思考.  ",
+                "正在思考.. ",
+                "正在思考..."
+        };
+
+        private final Terminal terminal;
+        private final AtomicBoolean active = new AtomicBoolean(false);
+        private final AtomicBoolean outputStarted = new AtomicBoolean(false);
+        private Thread ticker;
+
+        /**
+         * 创建思考提示器，负责在助手真正输出前显示动态文案。
+         */
+        private ThinkingIndicator(Terminal terminal) {
+            this.terminal = terminal;
+        }
+
+        /**
+         * 启动闪烁提示，并在同一行循环刷新。
+         */
+        private void start() {
+            if (!active.compareAndSet(false, true)) {
+                return;
+            }
+            ticker = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    int index = 0;
+                    while (active.get() && !outputStarted.get()) {
+                        render(FRAMES[index % FRAMES.length]);
+                        index++;
+                        try {
+                            Thread.sleep(250L);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }
+            }, "mewcode-thinking-indicator");
+            ticker.setDaemon(true);
+            ticker.start();
+        }
+
+        /**
+         * 当首个可见输出出现时停止提示，并恢复助手前缀。
+         */
+        private void markOutputStarted() {
+            if (!outputStarted.compareAndSet(false, true)) {
+                return;
+            }
+            stopTicker();
+            synchronized (terminal) {
+                terminal.writer().print("\r" + CLEAR_LINE + assistantLeadText());
+                terminal.writer().flush();
+            }
+        }
+
+        /**
+         * 在流程结束但还没有正式输出时停止提示，避免残留闪烁文案。
+         */
+        private void stop() {
+            stopTicker();
+            if (outputStarted.get()) {
+                return;
+            }
+            synchronized (terminal) {
+                terminal.writer().print("\r" + CLEAR_LINE + assistantLeadText());
+                terminal.writer().flush();
+            }
+        }
+
+        /**
+         * 停止后台刷新线程。
+         */
+        private void stopTicker() {
+            active.set(false);
+            if (ticker != null) {
+                ticker.interrupt();
+                try {
+                    ticker.join(500L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        /**
+         * 使用同一行重绘当前思考帧，避免刷屏。
+         */
+        private void render(String frame) {
+            synchronized (terminal) {
+                terminal.writer().print("\r" + CLEAR_LINE + assistantLeadText() + DIM + frame + RESET);
+                terminal.writer().flush();
+            }
+        }
+    }
+
     private static void clearTransientLine(Terminal terminal) {
         terminal.writer().print("\r" + CLEAR_LINE);
         terminal.writer().flush();
