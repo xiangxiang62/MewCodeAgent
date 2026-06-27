@@ -1,0 +1,1 @@
+C:\Users\19643\.jdks\ms-21.0.11\bin\java.exe -jar ..\MewcodeAgent\target\mewcode-agent-0.1.0-SNAPSHOT.jar D:\AI-Project\MewcodeAgent\config.yaml
